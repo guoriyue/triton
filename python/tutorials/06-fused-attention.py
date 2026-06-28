@@ -50,10 +50,21 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
                     offset_y, dtype: tl.constexpr, start_m, qk_scale,  #
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
-                    N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr):
+                    N_CTX: tl.constexpr, warp_specialize: tl.constexpr, IS_HOPPER: tl.constexpr,  #
+                    WINDOW_SIZE: tl.constexpr):
     # range of values handled by this stage
     if STAGE == 1:
-        lo, hi = 0, start_m * BLOCK_M
+        hi = start_m * BLOCK_M
+        if WINDOW_SIZE > 0:
+            # Sliding window: each query attends only to the previous WINDOW_SIZE
+            # keys, so the off-band loop can skip key blocks that lie entirely to
+            # the left of the window instead of starting from 0.
+            lo = start_m * BLOCK_M - WINDOW_SIZE + 1
+            lo = tl.maximum(lo, 0)
+            lo = (lo // BLOCK_N) * BLOCK_N
+            lo = tl.multiple_of(lo, BLOCK_N)
+        else:
+            lo = 0
     elif STAGE == 2:
         lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
         lo = tl.multiple_of(lo, BLOCK_M)
@@ -73,6 +84,15 @@ def _attn_fwd_inner(acc, l_i, m_i, q,  #
         qk = tl.dot(q, k)
         if STAGE == 2:
             mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            if WINDOW_SIZE > 0:
+                mask = mask & ((start_n + offs_n[None, :]) > offs_m[:, None] - WINDOW_SIZE)
+            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk -= m_ij[:, None]
+        elif WINDOW_SIZE > 0:
+            # Off-band blocks under sliding window: mask out keys that fall to the
+            # left of the window's lower edge.
+            mask = (start_n + offs_n[None, :]) > offs_m[:, None] - WINDOW_SIZE
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
             m_ij = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_ij[:, None]
@@ -173,8 +193,9 @@ def _maybe_make_tensor_desc(desc_or_ptr, shape, strides, block_shape):
         return tl.make_tensor_descriptor(desc_or_ptr, shape, strides, block_shape)
 
 
-@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize"],
-                 prune_configs_by={'early_config_prune': prune_invalid_configs})
+@triton.autotune(configs=list(filter(keep, configs)),
+                 key=["N_CTX", "HEAD_DIM", "FP8_OUTPUT", "warp_specialize",
+                      "WINDOW_SIZE"], prune_configs_by={'early_config_prune': prune_invalid_configs})
 @triton.jit
 def _attn_fwd(sm_scale, M,  #
               Z, H, desc_q, desc_k, desc_v, desc_o, N_CTX,  #
@@ -185,6 +206,7 @@ def _attn_fwd(sm_scale, M,  #
               STAGE: tl.constexpr,  #
               warp_specialize: tl.constexpr,  #
               IS_HOPPER: tl.constexpr,  #
+              WINDOW_SIZE: tl.constexpr,  #
               ):
     dtype = tl.float8e5 if FP8_OUTPUT else tl.float16
     tl.static_assert(BLOCK_N <= HEAD_DIM)
@@ -230,7 +252,7 @@ def _attn_fwd(sm_scale, M,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         4 - STAGE, offs_m, offs_n, N_CTX,  #
-                                        warp_specialize, IS_HOPPER)
+                                        warp_specialize, IS_HOPPER, WINDOW_SIZE)
     # stage 2: on-band
     if STAGE & 2:
         acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q,  #
@@ -238,7 +260,7 @@ def _attn_fwd(sm_scale, M,  #
                                         offset_y, dtype, start_m, qk_scale,  #
                                         BLOCK_M, HEAD_DIM, BLOCK_N,  #
                                         2, offs_m, offs_n, N_CTX,  #
-                                        warp_specialize, IS_HOPPER)
+                                        warp_specialize, IS_HOPPER, WINDOW_SIZE)
     # epilogue
     m_i += tl.math.log2(l_i)
     acc = acc / l_i[:, None]
@@ -505,13 +527,17 @@ def _attn_bwd(Q, K, V, sm_scale,  #
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True):
+    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=True, window_size=-1):
         # shape constraints
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         # when v is in float8_e5m2 it is transposed.
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
         assert HEAD_DIM_K in {16, 32, 64, 128, 256}
+        # Sliding-window attention (e.g. Mistral): each query attends only to the
+        # previous `window_size` keys. window_size <= 0 disables it. It is defined
+        # on top of the causal mask, so causal must be set.
+        assert window_size <= 0 or causal, "sliding window attention requires causal=True"
         o = torch.empty_like(q)
         stage = 3 if causal else 1
         extra_kern_args = {}
@@ -566,16 +592,20 @@ class _attention(torch.autograd.Function):
             STAGE=stage,  #
             warp_specialize=warp_specialize,  #
             IS_HOPPER=is_hopper(),  #
+            WINDOW_SIZE=window_size,  #
             **extra_kern_args)
 
         ctx.save_for_backward(q, k, v, o, M)
         ctx.sm_scale = sm_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
+        ctx.window_size = window_size
         return o
 
     @staticmethod
     def backward(ctx, do):
+        if ctx.window_size > 0:
+            raise NotImplementedError("backward pass is not implemented for sliding-window attention")
         q, k, v, o, M = ctx.saved_tensors
         assert do.is_contiguous()
         assert q.stride() == k.stride() == v.stride() == o.stride() == do.stride()
@@ -690,6 +720,70 @@ def test_op(Z, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, dtyp
     torch.testing.assert_close(tri_dq, ref_dq, atol=1e-2, rtol=rtol)
 
 
+@pytest.mark.parametrize("Z, H, N_CTX", [(1, 2, 1024)])
+@pytest.mark.parametrize("HEAD_DIM", [64, 128])
+@pytest.mark.parametrize("WINDOW", [64, 128, 300])
+@pytest.mark.parametrize("warp_specialize", [False, True] if is_blackwell() else [False])
+def test_op_sliding_window(Z, H, N_CTX, HEAD_DIM, WINDOW, warp_specialize, dtype=torch.float16):
+    # Forward-only sliding-window (causal) attention: query i attends to keys
+    # (i - WINDOW, i]. Validated against a masked reference.
+    torch.manual_seed(20)
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    sm_scale = 0.5
+    # reference implementation: causal AND within the sliding window
+    idx = torch.arange(N_CTX, device=DEVICE)
+    mask = (idx[:, None] >= idx[None, :]) & (idx[None, :] > idx[:, None] - WINDOW)
+    p = torch.matmul(q, k.transpose(2, 3)) * sm_scale
+    p = p.masked_fill(~mask, float("-inf"))
+    p = torch.softmax(p.float(), dim=-1).to(dtype)
+    ref_out = torch.matmul(p, v).half()
+    # triton implementation (positional args: causal, sm_scale, warp_specialize, window_size)
+    tri_out = attention(q, k, v, True, sm_scale, warp_specialize, WINDOW).half()
+    torch.testing.assert_close(tri_out, ref_out, atol=1e-2, rtol=0)
+
+
+@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 1024, 64)])
+@pytest.mark.parametrize("WINDOW_MULT", [1, 2])
+def test_op_sliding_window_causal_equiv(Z, H, N_CTX, HEAD_DIM, WINDOW_MULT, dtype=torch.float16):
+    # A window at least as wide as the sequence never binds, so windowed attention
+    # must reduce exactly to plain causal attention (checked against the causal kernel).
+    torch.manual_seed(20)
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    sm_scale = 0.5
+    causal_out = attention(q, k, v, True, sm_scale, False, -1).half()
+    window_out = attention(q, k, v, True, sm_scale, False, WINDOW_MULT * N_CTX).half()
+    torch.testing.assert_close(window_out, causal_out, atol=1e-2, rtol=0)
+
+
+def test_op_sliding_window_backward_not_implemented(dtype=torch.float16):
+    # Sliding-window attention is forward-only; backward must raise NotImplementedError.
+    torch.manual_seed(20)
+    Z, H, N_CTX, HEAD_DIM = 1, 2, 1024, 128
+    sm_scale = 0.5
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    k = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    v = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5).requires_grad_()
+    o = attention(q, k, v, True, sm_scale, False, 128)
+    with pytest.raises(NotImplementedError, match="backward pass is not implemented for sliding-window attention"):
+        o.sum().backward()
+
+
+@pytest.mark.parametrize("Z, H, N_CTX, HEAD_DIM", [(1, 2, 128, 64)])
+def test_op_sliding_window_requires_causal(Z, H, N_CTX, HEAD_DIM, dtype=torch.float16):
+    # window_size > 0 with causal=False must be rejected: otherwise the kernel would
+    # silently run over the full range with only the lower window-edge mask.
+    q = torch.empty((Z, H, N_CTX, HEAD_DIM), dtype=dtype, device=DEVICE).normal_(mean=0.0, std=0.5)
+    k = torch.empty_like(q).normal_(mean=0.0, std=0.5)
+    v = torch.empty_like(q).normal_(mean=0.0, std=0.5)
+    sm_scale = 0.5
+    with pytest.raises(AssertionError, match="sliding window attention requires causal=True"):
+        attention(q, k, v, False, sm_scale, False, 128)
+
+
 try:
     from flash_attn.flash_attn_interface import \
         flash_attn_qkvpacked_func as flash_attn_func
@@ -730,9 +824,34 @@ for HEAD_DIM in [64, 128]:
                         },
                     ))
 
+# Sliding-window (causal, forward) benchmark: as the sequence grows past the
+# window, out-of-window key blocks are skipped, so latency stays roughly flat.
+for HEAD_DIM in [64, 128]:
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=["N_CTX"],
+            x_vals=[2**i for i in range(10, 15)],
+            line_arg="provider",
+            line_vals=["triton-fp16"] + (["triton-fp8"] if TORCH_HAS_FP8 else []),
+            line_names=["Triton [FP16]"] + (["Triton [FP8]"] if TORCH_HAS_FP8 else []),
+            styles=[("red", "-"), ("blue", "-")],
+            ylabel="TFLOPS",
+            plot_name=f"sliding-window-attention-batch{BATCH}-head{N_HEADS}-d{HEAD_DIM}-window1024",
+            args={
+                "H": N_HEADS,
+                "BATCH": BATCH,
+                "HEAD_DIM": HEAD_DIM,
+                "mode": "fwd",
+                "causal": True,
+                "warp_specialize": False,
+                "window_size": 1024,
+            },
+        ))
+
 
 @triton.testing.perf_report(configs)
-def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, device=DEVICE):
+def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mode, provider, window_size=-1,
+                          device=DEVICE):
     assert mode in ["fwd", "bwd"]
     dtype = torch.float16
     if "triton" in provider:
@@ -746,7 +865,7 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
             v = v.permute(0, 1, 3, 2)
             v = v.to(torch.float8_e5m2)
         sm_scale = 1.3
-        fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize)
+        fn = lambda: attention(q, k, v, causal, sm_scale, warp_specialize, window_size)
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)
@@ -763,7 +882,11 @@ def bench_flash_attention(BATCH, H, N_CTX, HEAD_DIM, causal, warp_specialize, mo
         ms = triton.testing.do_bench(fn)
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * HEAD_DIM
     total_flops = 2 * flops_per_matmul
-    if causal:
+    if window_size > 0:
+        # sliding-window causal: ~window keys per query instead of ~N_CTX/2
+        w = min(window_size, N_CTX)
+        total_flops *= (w * N_CTX - w * w / 2) / (N_CTX * N_CTX)
+    elif causal:
         total_flops *= 0.5
     if mode == "bwd":
         total_flops *= 2.5  # 2.0(bwd) + 0.5(recompute)
