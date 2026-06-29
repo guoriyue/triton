@@ -1209,10 +1209,9 @@ def test_mxfp8_mxfp4_matmul(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, B_TR
         else:
             # sm120 lowers mixed FP8 x FP4 through the kind::mxf8f6f4 MMA by
             # widening the FP4 operand to e4m3, so exactly one operand is FP4.
+            # The FP4 operand may be packed along either K or M/N.
             if (A_DATA_TYPE == "float4") == (B_DATA_TYPE == "float4"):
                 pytest.skip("sm120 mixed path requires exactly one FP4 operand")
-            if not PACK_B_ALONG_K:
-                pytest.skip("Packing FP4 along M/N is not supported on sm120")
     elif is_hip():
         if not (is_hip_cdna4() or is_hip_gfx1250()):
             pytest.skip("Scaled mxfp4 & mxfp8 matmul is only natively supported on CDNA4 and above")
@@ -1228,6 +1227,11 @@ def test_mxfp8_mxfp4_matmul(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, NUM_STAGES, B_TR
         pytest.skip("Pack along K can only be False for float4")
     if BLOCK_N == 256 and BLOCK_K == 256:
         NUM_STAGES = 2
+        # On sm120 the M/N-packed FP4 operand is widened to e4m3, which doubles
+        # its shared-memory footprint, so a double-buffered stage doesn't fit at
+        # this block size.
+        if is_cuda() and torch.cuda.get_device_capability()[0] == 12 and not PACK_B_ALONG_K:
+            NUM_STAGES = 1
 
     torch.manual_seed(42)
 

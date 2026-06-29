@@ -779,14 +779,18 @@ public:
     // bits and only widened in registers right before the MMA.
     auto aElemTypeNew = aElemType;
     auto bElemTypeNew = bElemType;
-    auto widenFp4ToE4M3 = [&](Value v, int opIdx) -> Value {
+    auto widenFp4ToE4M3 = [&](Value v, int opIdx, bool kPack) -> Value {
       auto ty = cast<RankedTensorType>(v.getType());
-      int kAxis = (opIdx == 0) ? ty.getRank() - 1 : ty.getRank() - 2;
-      // Unpack e2m1 (i8, two values per byte) to f16, reusing the tested path;
-      // this doubles the K axis so it matches the FP8 operand.
+      int rank = ty.getRank();
+      // The FP4 operand packs two values per byte along its packed axis: the K
+      // dimension when kPack, otherwise the M/N dimension (same convention as
+      // DecomposeScaledBlocked). Unpack along that axis so the widened operand
+      // is full-size and matches the FP8 operand.
+      int packedAxis = kPack ? ((opIdx == 0) ? rank - 1 : rank - 2)
+                             : ((opIdx == 0) ? rank - 2 : rank - 1);
       auto vTyped = cast<TypedValue<RankedTensorType>>(v);
       Value asF16 = triton::gpu::Fp4ToFpOp::create(
-          rewriter, dotOp.getLoc(), vTyped, rewriter.getF16Type(), kAxis);
+          rewriter, dotOp.getLoc(), vTyped, rewriter.getF16Type(), packedAxis);
       auto f16Ty = cast<RankedTensorType>(asF16.getType());
       auto f8Ty = RankedTensorType::get(
           f16Ty.getShape(), Float8E4M3FNType::get(rewriter.getContext()),
@@ -798,20 +802,18 @@ public:
       return triton::FpToFpOp::create(rewriter, dotOp.getLoc(), f8Ty, asF16,
                                       rnd);
     };
-    // The widening unpacks the FP4 operand along K, so it only handles a
-    // K-packed FP4 operand; a non-K-packed one falls back to decomposition.
+    // Widening fully unpacks the FP4 operand, so the rewritten dot's pack flags
+    // describe e4m3 operands and are no longer "packed".
+    bool newLhsKPack = dotOp.getLhsKPack();
+    bool newRhsKPack = dotOp.getRhsKPack();
     if (isFP4(aElemType) && isFP8(bElemType)) {
-      if (!dotOp.getLhsKPack())
-        return rewriter.notifyMatchFailure(
-            dotOp, "sm120 mixed FP8xFP4 requires a K-packed FP4 operand");
-      a = widenFp4ToE4M3(a, /*opIdx=*/0);
+      a = widenFp4ToE4M3(a, /*opIdx=*/0, dotOp.getLhsKPack());
       aElemTypeNew = ScaleDotElemType::E4M3;
+      newLhsKPack = true;
     } else if (isFP8(aElemType) && isFP4(bElemType)) {
-      if (!dotOp.getRhsKPack())
-        return rewriter.notifyMatchFailure(
-            dotOp, "sm120 mixed FP8xFP4 requires a K-packed FP4 operand");
-      b = widenFp4ToE4M3(b, /*opIdx=*/1);
+      b = widenFp4ToE4M3(b, /*opIdx=*/1, dotOp.getRhsKPack());
       bElemTypeNew = ScaleDotElemType::E4M3;
+      newRhsKPack = true;
     }
 
     auto oldAType = cast<RankedTensorType>(a.getType());
@@ -848,7 +850,7 @@ public:
     newDot = triton::DotScaledOp::create(
         rewriter, dotOp.getLoc(), mmaResult.newRetType, newA, newB,
         mmaResult.newAcc, aScale, bScale, aElemTypeNew, bElemTypeNew,
-        dotOp.getFastMath(), dotOp.getLhsKPack(), dotOp.getRhsKPack());
+        dotOp.getFastMath(), newLhsKPack, newRhsKPack);
     rewriter.replaceOpWithNewOp<ConvertLayoutOp>(dotOp, dotOp.getType(),
                                                  newDot->getResult(0));
     return success();
