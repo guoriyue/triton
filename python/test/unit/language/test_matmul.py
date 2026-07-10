@@ -1373,6 +1373,9 @@ def test_batched_mxfp(BATCH_SIZE, BLOCK_BATCH_SIZE, BLOCK_M, BLOCK_N, BLOCK_K, N
         if is_hip_cdna4() and NUM_STAGES > 1 and max(BLOCK_M, BLOCK_N) > 64:
             pytest.skip("Config requires too much shared memory")
 
+    if (is_cuda() and torch.cuda.get_device_capability()[0] == 12 and NUM_STAGES > 1 and BLOCK_BATCH_SIZE > 1):
+        pytest.skip("Config requires too much shared memory on sm120")
+
     torch.manual_seed(42)
     dtype_src_str = "float8e5"
     dtype_dst_str = "float32"

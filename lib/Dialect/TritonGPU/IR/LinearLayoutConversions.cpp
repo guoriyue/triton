@@ -1629,29 +1629,34 @@ LinearLayout getSM120DotScaledScaleLayout(MLIRContext *ctx,
   StringAttr kRegister = StringAttr::get(ctx, "register");
   StringAttr kLane = StringAttr::get(ctx, "lane");
   StringAttr kWarp = StringAttr::get(ctx, "warp");
-  // - A: [M, K]
-  // - B: [K, N]
-  // - aScale: [M, K / K_GROUP_SIZE]
-  // - bScale: [N, K / K_GROUP_SIZE]
-  const unsigned kIdx = 1;
-  const unsigned mnIdx = 0;
+  // Without the optional leading batch dim, the operands are:
+  // - A: [M, K]                 - aScale: [M, K / K_GROUP_SIZE]
+  // - B: [K, N]                 - bScale: [N, K / K_GROUP_SIZE]
+  // K is the last dim, M/N the second-to-last, and (for batched dots) the
+  // batch dim is dim 0.
+  bool hasBatchDim = rank == 3;
+  const unsigned kIdx = rank - 1;
+  const unsigned mnIdx = rank - 2;
 
   std::vector<std::vector<int32_t>> laneBase;
   SmallVector<unsigned> order;
-  SmallVector<unsigned> mmaWarpsPerCTA;
+  SmallVector<unsigned> mmaWarpsPerCTA = llvm::to_vector(warpsPerCTA);
   if (opIdx == 0) {
     laneBase = {{8, 0}, {0, 0}, {1, 0}, {2, 0}, {4, 0}};
-    order = SmallVector<unsigned>{1u, 0u};
-    mmaWarpsPerCTA = SmallVector<unsigned>{warpsPerCTA[0], warpsPerCTA[1]};
+    order = SmallVector<unsigned>{kIdx, mnIdx};
   } else {
     laneBase = {{0, 0}, {0, 0}, {1, 0}, {2, 0}, {4, 0}};
-    order = SmallVector<unsigned>{0u, 1u};
-    mmaWarpsPerCTA = SmallVector<unsigned>{warpsPerCTA[1], warpsPerCTA[0]};
+    order = SmallVector<unsigned>{mnIdx, kIdx};
+    std::swap(mmaWarpsPerCTA[mnIdx], mmaWarpsPerCTA[kIdx]);
   }
+  // The batch dim is not distributed across lanes/registers; add it as the
+  // outermost warp factor so the layout has `rank` output dims.
+  if (hasBatchDim)
+    order.push_back(0u);
   LinearLayout LL =
-      LinearLayout::identity1D(shape[1], kRegister, outDims[kIdx]) *
+      LinearLayout::identity1D(shape[kIdx], kRegister, outDims[kIdx]) *
       LinearLayout({{kLane, laneBase}}, {outDims[mnIdx], outDims[kIdx]}) *
-      broadcastedDotOperandLayout(ctx, mmaWarpsPerCTA, order, 1u, kWarp);
+      broadcastedDotOperandLayout(ctx, mmaWarpsPerCTA, order, kIdx, kWarp);
   return combineCtaCgaWithShape(LL, cgaLayout, shape);
 }
 
