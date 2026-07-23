@@ -14,12 +14,7 @@
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Tools/LayoutUtils.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
-
-#define DEBUG_TYPE "tritongpu-optimize-thread-locality"
-#define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
-#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 namespace mlir {
 namespace triton {
@@ -247,230 +242,129 @@ struct OptimizeGatherLayoutPattern : public mlir::OpRewritePattern<GatherOp> {
 
 namespace {
 
-struct DescriptorReductionLayoutCandidate {
-  int64_t saving;
-  SmallVector<std::pair<Operation *, Attribute>> descriptorLayouts;
-};
+// Follow an exclusive chain of elementwise operations with one live tensor
+// input from a descriptor load to one reduction. Other tensor operands must be
+// constants. Keeping the initial policy narrow makes layout propagation
+// predictable and avoids estimating arbitrary producer DAGs.
+static ReduceOp getSingleReductionConsumer(DescriptorLoadOp load) {
+  if (load->getNumResults() != 1)
+    return {};
+  Value value = load->getResult(0);
+  while (value.hasOneUse()) {
+    Operation *user = *value.getUsers().begin();
+    if (auto reduce = dyn_cast<ReduceOp>(user)) {
+      if (reduce->getNumOperands() != 1 || reduce->getNumResults() != 1 ||
+          reduce.getOperand(0) != value)
+        return {};
+      return reduce;
+    }
 
-// Estimate the number of shared-memory load instructions each thread needs to
-// consume a descriptor result. The global TMA transfer is identical for all
-// distributed layouts, so only the shared-to-register vector width matters.
-static int64_t getDescriptorLoadCost(RankedTensorType type) {
-  auto contigPerThread = getContigPerThread(type);
-  unsigned contiguousDim = getOrder(type).front();
-  unsigned maxVectorWidth = 128 / type.getElementTypeBitWidth();
-  unsigned vectorWidth =
-      std::max(1u, std::min(contigPerThread[contiguousDim], maxVectorWidth));
-  unsigned elemsPerThread = getTotalElemsPerThread(type);
-  return (elemsPerThread + vectorWidth - 1) / vectorWidth;
-}
+    if (!user->hasTrait<OpTrait::Elementwise>() || !isMemoryEffectFree(user) ||
+        user->getNumResults() != 1)
+      return {};
+    auto valueType = dyn_cast<RankedTensorType>(value.getType());
+    auto resultType = dyn_cast<RankedTensorType>(user->getResult(0).getType());
+    if (!valueType || !resultType ||
+        valueType.getShape() != resultType.getShape() ||
+        valueType.getEncoding() != resultType.getEncoding())
+      return {};
 
-// Count the per-thread work performed by a reduction. Each communication stage
-// consists of a data movement and a combine instruction. This intentionally
-// uses structural instruction counts instead of target-specific latency
-// constants.
-static int64_t getReductionCost(RankedTensorType type, unsigned axis) {
-  auto elemsPerThread = getElemsPerThread(type);
-  unsigned axisElemsPerThread = elemsPerThread[axis];
-  unsigned totalElemsPerThread = getTotalElemsPerThread(type);
-  unsigned resultElemsPerThread = totalElemsPerThread / axisElemsPerThread;
-  auto threadsPerWarp = getThreadsPerWarp(type.getEncoding(), type.getShape());
-  auto warpsPerCTA = getWarpsPerCTA(type.getEncoding(), type.getShape());
-  unsigned communicationStages = llvm::Log2_64_Ceil(threadsPerWarp[axis]) +
-                                 llvm::Log2_64_Ceil(warpsPerCTA[axis]);
-  int64_t localCombines = resultElemsPerThread * (axisElemsPerThread - 1);
-  int64_t communication = 2 * resultElemsPerThread * communicationStages;
-  return localCombines + communication;
-}
-
-static int64_t getSliceWorkCost(const SetVector<Value> &slice,
-                                const DenseMap<Value, Attribute> &layouts,
-                                bool useCandidateLayouts) {
-  int64_t cost = 0;
-  for (Value value : slice) {
-    Operation *op = value.getDefiningOp();
-    if (!op || isa<DescriptorLoadOp, arith::ConstantOp>(op))
-      continue;
-    auto type = dyn_cast<RankedTensorType>(value.getType());
-    if (!type)
-      continue;
-    if (useCandidateLayouts)
-      type = type.cloneWithEncoding(layouts.lookup(value));
-    cost += getTotalElemsPerThread(type);
+    bool foundValue = false;
+    for (Value operand : user->getOperands()) {
+      if (!isa<RankedTensorType>(operand.getType()))
+        continue;
+      if (operand == value) {
+        foundValue = true;
+        continue;
+      }
+      if (!operand.getDefiningOp<arith::ConstantOp>())
+        return {};
+    }
+    if (!foundValue)
+      return {};
+    value = user->getResult(0);
   }
-  return cost;
+  return {};
 }
 
-static std::optional<DescriptorReductionLayoutCandidate>
-analyzeDescriptorReductionLayout(ReduceOp reduce,
-                                 BlockedEncodingAttr candidateEncoding) {
+static bool hasSupportedCombiner(ReduceOp reduce) {
   Operation *combiner = reduce.getSingleCombiner();
-  if (!combiner ||
-      !isa<arith::AddFOp, arith::MulFOp, arith::MaximumFOp, arith::MaxNumFOp,
-           arith::MinimumFOp, arith::MinNumFOp, arith::AddIOp, arith::MulIOp,
-           arith::MaxSIOp, arith::MinSIOp, arith::MaxUIOp, arith::MinUIOp>(
-          combiner))
-    return std::nullopt;
-  if (!ReduceOpHelper(reduce).isAssociative())
-    return std::nullopt;
-
-  SetVector<Value> slice;
-  DenseMap<Value, Attribute> layouts;
-  for (OpOperand &operand : reduce->getOpOperands()) {
-    auto stopAtDescriptor = [](Operation *op) {
-      return isa<DescriptorLoadOp>(op);
-    };
-    if (failed(getConvertBackwardSlice(operand, slice, candidateEncoding,
-                                       layouts, stopAtDescriptor))) {
-      LDBG("candidate backward slice failed");
-      return std::nullopt;
-    }
-  }
-
-  DenseSet<Operation *> sliceOps;
-  llvm::MapVector<Operation *, Value> descriptorResults;
-  for (Value value : slice) {
-    Operation *op = value.getDefiningOp();
-    if (!op) {
-      LDBG("candidate slice reached a block argument");
-      return std::nullopt;
-    }
-    sliceOps.insert(op);
-    if (isa<DescriptorLoadOp>(op)) {
-      if (op->getNumResults() != 1 || value != op->getResult(0)) {
-        LDBG("candidate found unsupported descriptor result");
-        return std::nullopt;
-      }
-      descriptorResults.try_emplace(op, value);
-      continue;
-    }
-    if (!isMemoryEffectFree(op)) {
-      LDBG("candidate found effectful interior op " << *op);
-      return std::nullopt;
-    }
-  }
-  if (descriptorResults.empty()) {
-    LDBG("candidate found no descriptor root");
-    return std::nullopt;
-  }
-
-  // Changing the layout of a descriptor result with an external user would
-  // leave a full-tensor conversion on that path. Defer those DAGs until the
-  // model can account for their conversion cost explicitly.
-  for (Value value : slice) {
-    for (Operation *user : value.getUsers()) {
-      if (user != reduce && !sliceOps.contains(user)) {
-        LDBG("candidate slice has external user " << *user);
-        return std::nullopt;
-      }
-    }
-  }
-
-  int64_t currentCost =
-      getSliceWorkCost(slice, layouts, /*useCandidateLayouts=*/false);
-  int64_t candidateCost =
-      getSliceWorkCost(slice, layouts, /*useCandidateLayouts=*/true);
-
-  for (Value operand : reduce->getOperands()) {
-    auto currentType = cast<RankedTensorType>(operand.getType());
-    currentCost += getReductionCost(currentType, reduce.getAxis());
-    candidateCost += getReductionCost(
-        currentType.cloneWithEncoding(candidateEncoding), reduce.getAxis());
-  }
-
-  Attribute candidateResultEncoding =
-      inferDstEncoding(reduce, candidateEncoding);
-  if (!candidateResultEncoding)
-    return std::nullopt;
-  for (Value result : reduce->getResults()) {
-    auto currentType = cast<RankedTensorType>(result.getType());
-    auto candidateType = currentType.cloneWithEncoding(candidateResultEncoding);
-    // Layouts may replicate values differently. Treat the conversion as free
-    // only when register reordering is sufficient in both directions; this
-    // conservatively accounts for communication needed to create or remove
-    // replicated values.
-    if (!cvtReordersRegisters(candidateType, currentType) ||
-        !cvtReordersRegisters(currentType, candidateType)) {
-      candidateCost += 2 * std::max(getTotalElemsPerThread(candidateType),
-                                    getTotalElemsPerThread(currentType));
-    }
-  }
-
-  SmallVector<std::pair<Operation *, Attribute>> descriptorLayouts;
-  for (auto [op, value] : descriptorResults) {
-    auto currentType = cast<RankedTensorType>(value.getType());
-    auto candidateType = currentType.cloneWithEncoding(layouts.lookup(value));
-    auto candidateBlocked =
-        dyn_cast<BlockedEncodingAttr>(candidateType.getEncoding());
-    if (!candidateBlocked)
-      return std::nullopt;
-    // Preserve at least one 32-bit shared-memory bank access. Sub-bank scalar
-    // accesses do not reduce shared-memory traffic and create long serial
-    // reduction chains for narrow element types.
-    if (candidateBlocked.getSizePerThread()[candidateBlocked.getOrder()[0]] *
-            candidateType.getElementTypeBitWidth() <
-        32)
-      return std::nullopt;
-    currentCost += getDescriptorLoadCost(currentType);
-    candidateCost += getDescriptorLoadCost(candidateType);
-    descriptorLayouts.emplace_back(op, candidateType.getEncoding());
-  }
-
-  LDBG("candidate " << candidateEncoding << " costs " << candidateCost
-                    << " vs current " << currentCost);
-  if (candidateCost >= currentCost)
-    return std::nullopt;
-  return DescriptorReductionLayoutCandidate{currentCost - candidateCost,
-                                            std::move(descriptorLayouts)};
+  return combiner &&
+         isa<arith::AddFOp, arith::MulFOp, arith::MaximumFOp, arith::MaxNumFOp,
+             arith::MinimumFOp, arith::MinNumFOp, arith::AddIOp, arith::MulIOp,
+             arith::MaxSIOp, arith::MinSIOp, arith::MaxUIOp, arith::MinUIOp>(
+             combiner) &&
+         ReduceOpHelper(reduce).isAssociative();
 }
 
-static SmallVector<BlockedEncodingAttr>
-getDescriptorReductionLayoutCandidates(ReduceOp reduce) {
-  auto srcType = cast<RankedTensorType>(reduce.getOperand(0).getType());
+// Pick one explicit policy layout rather than assigning latency-like weights to
+// descriptor loads, elementwise work, reductions, and conversions. Once a
+// shared-memory access is at least one 32-bit bank word wide, prefer a layout
+// that componentwise reduces lane- and warp-level communication on the
+// reduction axis.
+static std::optional<BlockedEncodingAttr>
+getPreferredDescriptorReductionLayout(DescriptorLoadOp load, ReduceOp reduce) {
+  auto srcType = cast<RankedTensorType>(load.getType());
+  auto reduceType = cast<RankedTensorType>(reduce.getOperand(0).getType());
   auto current = dyn_cast<BlockedEncodingAttr>(srcType.getEncoding());
   if (!current || !isa<RankedTensorType>(reduce->getResult(0).getType()) ||
-      srcType.getRank() < 2)
-    return {};
+      srcType.getRank() < 2 || srcType.getShape() != reduceType.getShape() ||
+      srcType.getEncoding() != reduceType.getEncoding())
+    return std::nullopt;
 
   unsigned axis = reduce.getAxis();
   if (getCTASplitNum(current)[axis] != 1)
-    return {};
+    return std::nullopt;
 
   auto order = llvm::to_vector(current.getOrder());
   unsigned contiguousDim = order.front();
   if (axis == contiguousDim)
-    return {};
+    return std::nullopt;
   llvm::erase(order, axis);
   order.push_back(axis);
 
   auto sizePerThread = llvm::to_vector(current.getSizePerThread());
   for (unsigned dim = 0; dim < sizePerThread.size(); ++dim) {
     if (dim != contiguousDim && sizePerThread[dim] != 1)
-      return {};
+      return std::nullopt;
   }
 
   auto module = reduce->getParentOfType<ModuleOp>();
   int numWarps = lookupNumWarps(reduce);
   int threadsPerWarp = TritonGPUDialect::getThreadsPerWarp(module);
   auto cgaLayout = getCGALayout(current);
-  unsigned maxVectorWidth = sizePerThread[contiguousDim];
+  Type elementType = srcType.getElementType();
+  if (!elementType.isIntOrFloat())
+    return std::nullopt;
+  unsigned bitWidth = elementType.getIntOrFloatBitWidth();
+  constexpr unsigned bankBitWidth = 32;
+  unsigned bankWordElems =
+      std::max(1u, (bankBitWidth + bitWidth - 1) / bitWidth);
+  if (!llvm::isPowerOf2_32(bankWordElems))
+    return std::nullopt;
+  if (sizePerThread[contiguousDim] < bankWordElems)
+    return std::nullopt;
 
-  llvm::SmallSetVector<Attribute, 8> uniqueCandidates;
-  for (unsigned vectorWidth = 1; vectorWidth <= maxVectorWidth;
-       vectorWidth *= 2) {
-    SmallVector<unsigned> candidateSizePerThread(srcType.getRank(), 1);
-    candidateSizePerThread[contiguousDim] = vectorWidth;
-    auto candidate = BlockedEncodingAttr::get(
-        srcType.getContext(), srcType.getShape(), candidateSizePerThread, order,
-        numWarps, threadsPerWarp, cgaLayout);
-    if (candidate != current)
-      uniqueCandidates.insert(candidate);
-  }
+  SmallVector<unsigned> candidateSizePerThread(srcType.getRank(), 1);
+  candidateSizePerThread[contiguousDim] = bankWordElems;
+  auto candidate = BlockedEncodingAttr::get(
+      srcType.getContext(), srcType.getShape(), candidateSizePerThread, order,
+      numWarps, threadsPerWarp, cgaLayout);
+  if (candidate == current)
+    return std::nullopt;
 
-  SmallVector<BlockedEncodingAttr> candidates;
-  for (Attribute candidate : uniqueCandidates)
-    candidates.push_back(cast<BlockedEncodingAttr>(candidate));
-  return candidates;
+  auto currentThreads = getThreadsPerWarp(current, srcType.getShape())[axis];
+  auto candidateThreads =
+      getThreadsPerWarp(candidate, srcType.getShape())[axis];
+  auto currentWarps = getWarpsPerCTA(current, srcType.getShape())[axis];
+  auto candidateWarps = getWarpsPerCTA(candidate, srcType.getShape())[axis];
+  if (candidateThreads > currentThreads || candidateWarps > currentWarps ||
+      (candidateThreads == currentThreads && candidateWarps == currentWarps))
+    return std::nullopt;
+
+  if (!inferDstEncoding(reduce, candidate))
+    return std::nullopt;
+  return candidate;
 }
 
 static void optimizeDescriptorReductionLayouts(ModuleOp module) {
@@ -478,42 +372,16 @@ static void optimizeDescriptorReductionLayouts(ModuleOp module) {
   if (!target || !target.getValue().starts_with("cuda:"))
     return;
 
-  SmallVector<ReduceOp> reductions;
-  module.walk([&](ReduceOp reduce) { reductions.push_back(reduce); });
-
-  llvm::MapVector<Operation *, Attribute> selectedLayouts;
-  DenseSet<Operation *> conflicts;
-  for (ReduceOp reduce : reductions) {
-    std::optional<DescriptorReductionLayoutCandidate> best;
-    for (BlockedEncodingAttr candidate :
-         getDescriptorReductionLayoutCandidates(reduce)) {
-      LDBG("considering candidate " << candidate << " for " << reduce);
-      auto analyzed = analyzeDescriptorReductionLayout(reduce, candidate);
-      if (analyzed && (!best || analyzed->saving > best->saving))
-        best = std::move(analyzed);
-    }
-    if (!best)
+  SmallVector<DescriptorLoadOp> loads;
+  module.walk([&](DescriptorLoadOp load) { loads.push_back(load); });
+  for (DescriptorLoadOp load : loads) {
+    ReduceOp reduce = getSingleReductionConsumer(load);
+    if (!reduce || !hasSupportedCombiner(reduce))
       continue;
-
-    // A descriptor can currently be selected by at most one reduction:
-    // analyzeDescriptorReductionLayout's external-user check bails whenever a
-    // descriptor result feeds anything other than the single reduction being
-    // analyzed, so two reductions can never both claim the same descriptor.
-    // The conflict tracking here is therefore defensive -- it keeps the rewrite
-    // correct if that guard is ever relaxed to allow shared descriptors.
-    for (auto [descriptor, encoding] : best->descriptorLayouts) {
-      auto [it, inserted] = selectedLayouts.try_emplace(descriptor, encoding);
-      if (!inserted && it->second != encoding)
-        conflicts.insert(descriptor);
-    }
-  }
-
-  for (auto [descriptor, encoding] : selectedLayouts) {
-    if (!conflicts.contains(descriptor)) {
-      LDBG("selecting descriptor layout " << encoding << " for "
-                                          << *descriptor);
-      convertDistributedOpEncoding(encoding, descriptor);
-    }
+    auto candidate = getPreferredDescriptorReductionLayout(load, reduce);
+    if (!candidate)
+      continue;
+    convertDistributedOpEncoding(*candidate, load);
   }
 }
 
