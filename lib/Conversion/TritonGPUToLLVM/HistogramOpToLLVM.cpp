@@ -2,6 +2,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -130,9 +131,15 @@ public:
                                          1, std::multiplies<>());
 
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    for (auto i = 0; i < histogramValue.size(); ++i) {
-      histogramValue[i] =
-          b.sdiv(histogramValue[i], b.i32_val(replicationFactor));
+    // The counts are non-negative and replicationFactor is a power of two (a
+    // ratio of thread/warp counts), so undoing the overcounting is a right
+    // shift; skip it entirely when there is no replication.
+    if (replicationFactor > 1) {
+      assert(llvm::isPowerOf2_32(replicationFactor) &&
+             "replicationFactor must be a power of two");
+      Value shift = b.i32_val(llvm::Log2_32(replicationFactor));
+      for (auto i = 0; i < histogramValue.size(); ++i)
+        histogramValue[i] = b.lshr(histogramValue[i], shift);
     }
 
     Value results = packUniqueTensorElements(loc, typeConverter, histogramValue,
