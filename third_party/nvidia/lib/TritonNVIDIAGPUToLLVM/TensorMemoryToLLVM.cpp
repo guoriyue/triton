@@ -730,7 +730,10 @@ static LogicalResult copySharedToTmem(ConversionPatternRewriter &rewriter,
   for (int col = 0; col < cvt.getInDimSize(kCol); col += instrShape[1]) {
     if (col & holeMask)
       continue;
-    auto desc = loader->smemLoad(0, logicalCol, rewriter, loc);
+    auto descOrErr = loader->smemLoad(0, logicalCol, rewriter, loc);
+    if (failed(descOrErr))
+      return failure();
+    auto desc = *descOrErr;
     auto tmemAddr =
         b.add(b.ptrtoint(i32_ty, baseDst), b.i32_val(col * bitwidth / 32));
     createTcgen05Cp(rewriter, loc, tmemAddr, desc, pred, atom, twoCTAs);

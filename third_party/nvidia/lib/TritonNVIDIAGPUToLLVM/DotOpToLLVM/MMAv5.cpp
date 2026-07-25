@@ -622,8 +622,11 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
     for (int n = 0; n < numRepN; n++) {
       Value useInitAcc = useDFlag;
       for (int k = 0; k < numRepK; k++) {
-        Value b = bLoader->smemLoad(k * bOperandShape[0], n * bOperandShape[1],
-                                    rewriter, loc);
+        auto bOrErr = bLoader->smemLoad(k * bOperandShape[0],
+                                        n * bOperandShape[1], rewriter, loc);
+        if (failed(bOrErr))
+          return failure();
+        Value b = *bOrErr;
         for (int m = 0; m < 2; m++) {
           MemDescOperand accAddress =
               op.getAccAddress(rewriter, loc, m, n, desc);
@@ -644,8 +647,11 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
         for (int k = 0; k < numRepK; k++) {
           MemDescOperand a = aLoader->memLoad(
               m * aOperandShape[0], k * aOperandShape[1], rewriter, loc);
-          Value b = bLoader->smemLoad(k * bOperandShape[0],
-                                      n * bOperandShape[1], rewriter, loc);
+          auto bOrErr = bLoader->smemLoad(k * bOperandShape[0],
+                                          n * bOperandShape[1], rewriter, loc);
+          if (failed(bOrErr))
+            return failure();
+          Value b = *bOrErr;
           op.createMMAInst(rewriter, loc, accAddress, a, b, elect, useInitAcc,
                            desc, m, n, k, ReuseB::None);
           useInitAcc = tb.i1_val(1);
