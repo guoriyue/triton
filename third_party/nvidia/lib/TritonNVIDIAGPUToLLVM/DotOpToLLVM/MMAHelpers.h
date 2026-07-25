@@ -157,8 +157,8 @@ public:
     return DotOpMmaSmemLoader{*desc, baseb128, ll};
   }
 
-  Value smemLoad(int a, int b, ConversionPatternRewriter &rewriter,
-                 Location loc) const {
+  FailureOr<Value> smemLoad(int a, int b, ConversionPatternRewriter &rewriter,
+                            Location loc) const {
     auto *ctx = loc.getContext();
     auto tb = TritonLLVMOpBuilder(loc, rewriter);
     auto dims = to_vector(ll.getInDimNames());
@@ -168,7 +168,14 @@ public:
     auto offsetBlock = ll.apply({{dims[0], a}, {dims[1], b}});
     int32_t offsetElems = offsetBlock[0].second;
     int32_t block = offsetBlock[1].second;
-    assert(block == 0);
+    // This loader indexes a single CTA's shared memory. A non-zero block (CTA)
+    // offset -- reachable e.g. via a block-scaled dot with num_ctas > 1 (see
+    // issue #7982) -- is unsupported; emit a diagnostic instead of aborting on
+    // the assertion (which would also silently miscompile in an NDEBUG build).
+    if (block != 0)
+      return mlir::emitError(loc)
+             << "MMA operand shared-memory load does not support a non-zero "
+                "CTA block offset (num_ctas > 1)";
     int32_t smemByteOffsetb8 = offsetElems * desc.bitwidth / 8;
     auto currDesc = desc.descriptor;
     // Take the next 0/1/2/3 bits after the 128b tile
@@ -183,7 +190,11 @@ public:
   }
   MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
                          Location loc) const override {
-    return {smemLoad(a, b, rewriter, loc), std::nullopt};
+    // This non-fallible entry point is only used on paths where the block
+    // offset is always zero; smemLoad() only fails for a non-zero block.
+    auto desc = smemLoad(a, b, rewriter, loc);
+    assert(succeeded(desc));
+    return {*desc, std::nullopt};
   }
 
   MMASMEMDescriptor &getDescriptor() { return desc; }
