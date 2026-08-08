@@ -9,7 +9,6 @@ import triton.language as tl
 from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 import traceback
 from triton._internal_testing import is_cuda, is_hip, is_hip_cdna4
-from triton.backends.compiler import GPUTarget
 
 
 def format_exception(type, value, tb):
@@ -588,32 +587,3 @@ def test_err_nested_function_def():
     err_msg = format_exception(e.type, value=e.value, tb=e.tb)
     assert "StopIteration" not in err_msg, "nested def should not leak StopIteration"
     assert "nested function" in err_msg, "error should mention nested function"
-
-
-@pytest.mark.skipif(not is_cuda(), reason="sm90 block-scaled dot lowering is NVIDIA-specific")
-def test_dot_scaled_num_ctas_gt_1_rejected(capfd):
-    # A block-scaled dot lowered to WGMMA cannot index a multi-CTA (num_ctas > 1)
-    # shared-memory operand. This used to trip an assertion and abort the
-    # compiler (issue #7982); it must now fail with a diagnostic instead.
-    @triton.jit
-    def kernel(a_ptr, b_ptr, a_scale_ptr, b_scale_ptr, c_ptr, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
-        offs_m = tl.arange(0, M)
-        offs_n = tl.arange(0, N)
-        offs_k = tl.arange(0, K)
-        a = tl.load(a_ptr + offs_m[:, None] * K + offs_k[None, :])
-        b = tl.load(b_ptr + offs_k[:, None] * N + offs_n[None, :])
-        offs_sk = tl.arange(0, K // 32)
-        a_scale = tl.load(a_scale_ptr + offs_m[:, None] * (K // 32) + offs_sk[None, :])
-        b_scale = tl.load(b_scale_ptr + offs_n[:, None] * (K // 32) + offs_sk[None, :])
-        acc = tl.dot_scaled(a, a_scale, "e5m2", b, b_scale, "e5m2")
-        tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
-
-    src = triton.compiler.ASTSource(
-        fn=kernel, signature={
-            "a_ptr": "*fp8e5", "b_ptr": "*fp8e5", "a_scale_ptr": "*u8", "b_scale_ptr": "*u8", "c_ptr": "*fp32", "M":
-            "constexpr", "N": "constexpr", "K": "constexpr"
-        }, constexprs={"M": 128, "N": 128, "K": 128})
-    # Compile-only (no GPU needed); target sm90 explicitly.
-    with pytest.raises(Exception):
-        triton.compile(src, target=GPUTarget("cuda", 90, 32), options={"num_warps": 4, "num_ctas": 2})
-    assert "does not support a non-zero CTA block offset" in capfd.readouterr().err

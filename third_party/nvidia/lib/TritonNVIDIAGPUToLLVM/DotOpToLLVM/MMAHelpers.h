@@ -44,9 +44,9 @@ public:
   virtual ~DotOpMmaMemLoader() = default;
   // Given the starting coordinates of the logical tensor (i.e. reps *
   // ctaTileSize), return the associated memory descriptor for SMEM / TMEM.
-  virtual MemDescOperand memLoad(int a, int b,
-                                 ConversionPatternRewriter &rewriter,
-                                 Location loc) const = 0;
+  virtual FailureOr<MemDescOperand>
+  memLoad(int a, int b, ConversionPatternRewriter &rewriter,
+          Location loc) const = 0;
 };
 
 class DotOpMmaSmemLoader : public DotOpMmaMemLoader {
@@ -188,13 +188,13 @@ public:
     Value descVal = tb.add(descValBase, baseb128);
     return descVal;
   }
-  MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
-                         Location loc) const override {
-    // This non-fallible entry point is only used on paths where the block
-    // offset is always zero; smemLoad() only fails for a non-zero block.
+  FailureOr<MemDescOperand>
+  memLoad(int a, int b, ConversionPatternRewriter &rewriter,
+          Location loc) const override {
     auto desc = smemLoad(a, b, rewriter, loc);
-    assert(succeeded(desc));
-    return {*desc, std::nullopt};
+    if (failed(desc))
+      return failure();
+    return MemDescOperand{*desc, std::nullopt};
   }
 
   MMASMEMDescriptor &getDescriptor() { return desc; }

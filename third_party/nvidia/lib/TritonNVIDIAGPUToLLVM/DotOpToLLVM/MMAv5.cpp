@@ -52,8 +52,9 @@ public:
     return {address, offset};
   }
 
-  MemDescOperand memLoad(int a, int b, ConversionPatternRewriter &rewriter,
-                         Location loc) const override {
+  FailureOr<MemDescOperand>
+  memLoad(int a, int b, ConversionPatternRewriter &rewriter,
+          Location loc) const override {
     return tmemLoad(a, b, rewriter, loc);
   }
 
@@ -630,8 +631,11 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
         for (int m = 0; m < 2; m++) {
           MemDescOperand accAddress =
               op.getAccAddress(rewriter, loc, m, n, desc);
-          MemDescOperand a =
+          auto aOrErr =
               aLoader->memLoad(m * mmaSizeM, k * mmaSizeK, rewriter, loc);
+          if (failed(aOrErr))
+            return failure();
+          MemDescOperand a = *aOrErr;
           ReuseB reuseB = m == 0 ? ReuseB::Keep : ReuseB::Lastuse;
           op.createMMAInst(rewriter, loc, accAddress, a, b, elect, useInitAcc,
                            desc, m, n, k, reuseB);
@@ -645,8 +649,11 @@ LogicalResult convertDotImpl(const LLVMTypeConverter &typeConverter,
         Value useInitAcc = useDFlag;
         MemDescOperand accAddress = op.getAccAddress(rewriter, loc, m, n, desc);
         for (int k = 0; k < numRepK; k++) {
-          MemDescOperand a = aLoader->memLoad(
+          auto aOrErr = aLoader->memLoad(
               m * aOperandShape[0], k * aOperandShape[1], rewriter, loc);
+          if (failed(aOrErr))
+            return failure();
+          MemDescOperand a = *aOrErr;
           auto bOrErr = bLoader->smemLoad(k * bOperandShape[0],
                                           n * bOperandShape[1], rewriter, loc);
           if (failed(bOrErr))
