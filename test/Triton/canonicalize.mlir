@@ -175,6 +175,17 @@ tt.func @fold_transpose_constant() -> tensor<128x16xf32> {
 }
 // -----
 
+// CHECK-LABEL: @fold_transpose_splat
+tt.func @fold_transpose_splat(%arg0: f32) -> tensor<128x16xf32> {
+    // CHECK: %[[splat:.*]] = tt.splat %arg0 : f32 -> tensor<128x16xf32>
+    // CHECK-NOT: tt.trans
+    %s = tt.splat %arg0 : f32 -> tensor<16x128xf32>
+    %r = tt.trans %s {order = array<i32: 1, 0>} : tensor<16x128xf32> -> tensor<128x16xf32>
+    // CHECK-NEXT: tt.return %[[splat]] : tensor<128x16xf32>
+    tt.return %r : tensor<128x16xf32>
+}
+// -----
+
 // CHECK-LABEL: @canonicalize_int_to_ptr_of_ptr_to_int
 // Test: int_to_ptr(ptr_to_int(ptr)) -> ptr (round-trip elimination)
 tt.func @canonicalize_int_to_ptr_of_ptr_to_int(%ptr: tensor<64x!tt.ptr<f32>>) -> tensor<64x!tt.ptr<f32>> {

@@ -200,6 +200,20 @@ OpFoldResult TransOp::fold(FoldAdaptor adaptor) {
   return {};
 }
 
+LogicalResult TransOp::canonicalize(TransOp op, PatternRewriter &rewriter) {
+  // trans(splat(x)) -> splat(x)
+  //
+  // Transposing a splat only permutes axes of an all-equal tensor, so the
+  // result is the same value broadcast to the transposed shape.  Mirrors the
+  // splat canonicalizations on expand_dims and reshape.  The constant-splat
+  // case is already handled by the folder; this covers a runtime tt.splat.
+  if (auto splat = op.getSrc().getDefiningOp<SplatOp>()) {
+    rewriter.replaceOpWithNewOp<SplatOp>(op, op.getType(), splat.getSrc());
+    return success();
+  }
+  return failure();
+}
+
 LogicalResult TransOp::verify() {
   auto order = getOrder();
   auto srcTy = cast<RankedTensorType>(getSrc().getType());

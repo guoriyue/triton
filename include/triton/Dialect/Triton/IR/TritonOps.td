@@ -629,6 +629,7 @@ def TT_TransOp : TT_Op<"trans", [Pure,
 
     let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
 
+    let hasCanonicalizeMethod = 1;
     let hasFolder = 1;
     let hasVerifier = 1;
 }
