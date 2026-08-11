@@ -1125,6 +1125,28 @@ def test_math_fma_op(dtype, device):
 
 
 @pytest.mark.interpreter
+def test_math_fma_single_rounding(device):
+    # fma applies a single rounding to x * y + z. With x = y = 1 + 2**-23 and
+    # z = -(1 + 2**-22) the exact result is 2**-46; a naive two-rounding
+    # (mul then add, each rounded in fp32) collapses it to 0.
+    SIZE = 16
+
+    @triton.jit
+    def kernel(Z, X, Y, W, SIZE: tl.constexpr):
+        off = tl.arange(0, SIZE)
+        z = tl.math.fma(tl.load(X + off), tl.load(Y + off), tl.load(W + off))
+        tl.store(Z + off, z)
+
+    x = torch.full((SIZE, ), float(np.float32(1 + 2**-23)), dtype=torch.float32, device=device)
+    y = x.clone()
+    w = torch.full((SIZE, ), float(np.float32(-(1 + 2**-22))), dtype=torch.float32, device=device)
+    z_ref = torch.full((SIZE, ), float(2**-46), dtype=torch.float32, device=device)
+    z_tri = torch.zeros_like(x)
+    kernel[(1, )](z_tri, x, y, w, SIZE=SIZE, num_warps=4)
+    torch.testing.assert_close(z_tri, z_ref, atol=0, rtol=0)
+
+
+@pytest.mark.interpreter
 @pytest.mark.parametrize("expr", ["tl.math.fdiv(x, y)", "tl.math.div_rn(x, y)"])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_math_divide_op(expr, num_ctas, device):

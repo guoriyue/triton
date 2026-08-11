@@ -671,7 +671,17 @@ class InterpreterBuilder:
     create_select = lambda self, cond, lhs, rhs: self.ternary_op(cond, lhs, rhs, np.where)
 
     def create_fma(self, x, y, z):
-        return TensorHandle(x.data * y.data + z.data, z.dtype.scalar)
+        dtype = z.dtype.scalar
+        # fma must apply a *single* rounding to x * y + z. Evaluating
+        # `x.data * y.data + z.data` in the input width rounds twice (once for
+        # the product, once for the sum), diverging from the GPU / libdevice
+        # fma and IEEE fmaf. float64 exactly represents the fp32 x fp32 product,
+        # so accumulating there and rounding once back to the result dtype
+        # matches hardware for fp32 (and narrower) inputs. fma is restricted to
+        # fp32/fp64; the fp64 case still double-rounds, which would need
+        # extended precision to avoid and is left as-is.
+        output = x.data.astype(np.float64) * y.data.astype(np.float64) + z.data.astype(np.float64)
+        return TensorHandle(output.astype(_get_np_dtype(dtype)), dtype)
 
     # unary functions
     def unary_op(self, arg, op):
