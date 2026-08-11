@@ -1125,6 +1125,32 @@ def test_math_fma_op(dtype, device):
 
 
 @pytest.mark.interpreter
+def test_dot_bf16_values(device):
+    # bfloat16 is stored as raw uint16 bits in the interpreter; without decoding
+    # them, tl.dot multiplied the bit patterns and returned garbage (~1e10).
+    if not is_interpreter():
+        if not is_cuda() or torch.cuda.get_device_capability()[0] < 8:
+            pytest.skip("bfloat16 dot requires NVGPU with cc >= 80")
+    M, N, K = 16, 16, 16
+
+    @triton.jit
+    def kernel(X, Y, Z, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+        xo = tl.arange(0, M)[:, None] * K + tl.arange(0, K)[None, :]
+        yo = tl.arange(0, K)[:, None] * N + tl.arange(0, N)[None, :]
+        zo = tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :]
+        z = tl.dot(tl.load(X + xo), tl.load(Y + yo))
+        tl.store(Z + zo, z)
+
+    torch.manual_seed(0)
+    x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    y = torch.randn(K, N, dtype=torch.bfloat16, device=device)
+    z = torch.zeros(M, N, dtype=torch.float32, device=device)
+    kernel[(1, )](x, y, z, M=M, N=N, K=K)
+    ref = x.float() @ y.float()
+    torch.testing.assert_close(z, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.interpreter
 @pytest.mark.parametrize("expr", ["tl.math.fdiv(x, y)", "tl.math.div_rn(x, y)"])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_math_divide_op(expr, num_ctas, device):

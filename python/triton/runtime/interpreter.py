@@ -719,6 +719,12 @@ class InterpreterBuilder:
            (b.dtype.primitive_bitwidth == 8 and b.dtype.is_floating()):
             a_data = _convert_float(a_data, a.dtype, tl.float16, None).view(np.float16)
             b_data = _convert_float(b_data, b.dtype, tl.float16, None).view(np.float16)
+        elif a.dtype == tl.bfloat16 or b.dtype == tl.bfloat16:
+            # bfloat16 is stored as raw uint16 bit patterns, so np.matmul would
+            # otherwise multiply the bits as integers. Decode both operands to
+            # fp32 real values (a no-op _convert_float for fp16/fp32 operands).
+            a_data = _convert_float(a_data, a.dtype, tl.float32, None).view(np.float32)
+            b_data = _convert_float(b_data, b.dtype, tl.float32, None).view(np.float32)
         return TensorHandle(np.matmul(a_data, b_data, dtype=d.data.dtype) + d.data, d.dtype.scalar)
 
     def create_make_range(self, ret_ty, start, stop):
