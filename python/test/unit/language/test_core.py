@@ -2861,6 +2861,31 @@ def test_reduce1d(op, dtype_str, shape, num_ctas, device):
             np.testing.assert_equal(z_ref, z_tri)
 
 
+@pytest.mark.interpreter
+def test_reduce_and(device):
+    # reduce_and is the bitwise-and sibling of reduce_or.
+    @triton.jit
+    def kernel(X, Z, BLOCK: tl.constexpr):
+        z = tl.reduce_and(tl.load(X + tl.arange(0, BLOCK)), axis=0)
+        tl.store(Z, z)
+
+    BLOCK = 8
+    x = torch.tensor([0xF3, 0xF5, 0xF7, 0xFF, 0xF1, 0xFB, 0xFD, 0xFF], dtype=torch.int32, device=device)
+    z = torch.zeros(1, dtype=torch.int32, device=device)
+    kernel[(1, )](x, z, BLOCK=BLOCK)
+    ref = 0xF3 & 0xF5 & 0xF7 & 0xFF & 0xF1 & 0xFB & 0xFD & 0xFF
+    assert z.item() == ref
+
+    # "all true" over a boolean mask.
+    xb = torch.ones(BLOCK, dtype=torch.int32, device=device)
+    zb = torch.zeros(1, dtype=torch.int32, device=device)
+    kernel[(1, )](xb, zb, BLOCK=BLOCK)
+    assert zb.item() == 1
+    xb[3] = 0
+    kernel[(1, )](xb, zb, BLOCK=BLOCK)
+    assert zb.item() == 0
+
+
 # TODO: [Qingyi] Fix argmin / argmax
 reduce_configs1 = [(op, dtype, (1, 1024), axis, False)
                    for dtype in dtypes_with_bfloat16

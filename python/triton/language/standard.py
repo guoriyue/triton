@@ -322,6 +322,22 @@ def reduce_or(input, axis, keep_dims=False):
     return core.reduce(input, axis, _or_combine, keep_dims=keep_dims)
 
 
+# and reduction
+
+
+@jit
+def _and_combine(x, y):
+    return x & y
+
+
+@core._tensor_member_fn
+@jit
+@core._add_reduction_docstr("reduce_and")
+def reduce_and(input, axis, keep_dims=False):
+    core.static_assert(input.type.scalar.is_int(), "reduce_and only supported for integers")
+    return core.reduce(input, axis, _and_combine, keep_dims=keep_dims)
+
+
 # cumsum
 
 
