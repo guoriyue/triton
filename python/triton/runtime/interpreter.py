@@ -557,6 +557,23 @@ class InterpreterBuilder:
     def binary_op(self, lhs, rhs, op):
         tl_dtype = lhs.dtype.scalar
 
+        lhs_is_bf16 = lhs.dtype.scalar == tl.bfloat16 and lhs.data.dtype == np.uint16
+        rhs_is_bf16 = rhs.dtype.scalar == tl.bfloat16 and rhs.data.dtype == np.uint16
+        if lhs_is_bf16 or rhs_is_bf16:
+            # bfloat16 is stored as raw uint16 bit patterns, so applying `op`
+            # directly would compute on the bits as integers. Decode operands to
+            # fp32, run the op on real values, and re-encode value results back
+            # to bf16 (comparisons produce a bool mask, returned as-is).
+            lhs_f = _convert_float(lhs.data, tl.bfloat16, tl.float32,
+                                   None).view(np.float32) if lhs_is_bf16 else lhs.data
+            rhs_f = _convert_float(rhs.data, tl.bfloat16, tl.float32,
+                                   None).view(np.float32) if rhs_is_bf16 else rhs.data
+            output = op(lhs_f, rhs_f)
+            if output.dtype != np.bool_:
+                output = _convert_float(output.astype(np.float32), tl.float32, tl.bfloat16,
+                                        _ir.ROUNDING_MODE.RTNE).view(np.uint16)
+            return TensorHandle(output, tl_dtype)
+
         if lhs.data.dtype == np.bool_ and rhs.data.dtype == np.bool_:
             # numpy uses logical/saturating semantics for bool arithmetic
             # (True + True == True) and rejects bool subtraction outright, but
@@ -675,6 +692,15 @@ class InterpreterBuilder:
 
     # unary functions
     def unary_op(self, arg, op):
+        if arg.dtype.scalar == tl.bfloat16 and arg.data.dtype == np.uint16:
+            # bfloat16 is stored as raw uint16 bits; decode to fp32, apply the
+            # op on real values, and re-encode to bf16 (see binary_op).
+            arg_f = _convert_float(arg.data, tl.bfloat16, tl.float32, None).view(np.float32)
+            output = op(arg_f)
+            if output.dtype != np.bool_:
+                output = _convert_float(output.astype(np.float32), tl.float32, tl.bfloat16,
+                                        _ir.ROUNDING_MODE.RTNE).view(np.uint16)
+            return TensorHandle(output, arg.dtype.scalar)
         return TensorHandle(op(arg.data), arg.dtype.scalar)
 
     def create_fabs(self, arg):

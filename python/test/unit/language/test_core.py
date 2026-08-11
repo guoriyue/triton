@@ -1125,6 +1125,60 @@ def test_math_fma_op(dtype, device):
 
 
 @pytest.mark.interpreter
+@pytest.mark.parametrize("op", ["x + y", "x * y", "x - y", "x / y", "-x", "tl.maximum(x, y)", "tl.minimum(x, y)"])
+def test_bf16_elementwise(op, device):
+    # bfloat16 is stored as raw uint16 bits in the interpreter; without decoding
+    # them, elementwise ops computed on the bit patterns and returned garbage.
+    if not is_interpreter():
+        if not is_cuda() or torch.cuda.get_device_capability()[0] < 8:
+            pytest.skip("bfloat16 requires NVGPU with cc >= 80")
+    N = 128
+
+    @triton.jit
+    def kernel(X, Y, Z, N: tl.constexpr, OP: tl.constexpr):
+        off = tl.arange(0, N)
+        x = tl.load(X + off)
+        y = tl.load(Y + off)
+        tl.store(Z + off, OP(x, y))
+
+    op_fn = eval(f"lambda x, y: {op}")
+    torch.manual_seed(0)
+    x = torch.randn(N, dtype=torch.bfloat16, device=device)
+    y = torch.randn(N, dtype=torch.bfloat16, device=device).abs() + 0.5
+    z = torch.zeros(N, dtype=torch.bfloat16, device=device)
+    kernel[(1, )](x, y, z, N=N, OP=op_fn)
+    ref = eval(op.replace("tl.", "torch."), {"torch": torch, "x": x.float(), "y": y.float()}).to(torch.bfloat16)
+    # Interpreter re-encodes to bf16 with its own RTNE cast, which can differ
+    # from torch's by up to 1 ULP; the pre-fix bug instead produced ~1e38.
+    torch.testing.assert_close(z, ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("cmp", ["x < y", "x > y", "x == y", "x <= y", "x != y"])
+def test_bf16_compare(cmp, device):
+    if not is_interpreter():
+        if not is_cuda() or torch.cuda.get_device_capability()[0] < 8:
+            pytest.skip("bfloat16 requires NVGPU with cc >= 80")
+    N = 128
+
+    @triton.jit
+    def kernel(X, Y, Z, N: tl.constexpr, CMP: tl.constexpr):
+        off = tl.arange(0, N)
+        m = CMP(tl.load(X + off), tl.load(Y + off))
+        tl.store(Z + off, m.to(tl.int32))
+
+    cmp_fn = eval(f"lambda x, y: {cmp}")
+    torch.manual_seed(0)
+    x = torch.randn(N, dtype=torch.bfloat16, device=device)
+    y = torch.randn(N, dtype=torch.bfloat16, device=device)
+    y[::2] = x[::2]  # exercise ties for ==, <=, !=
+    z = torch.zeros(N, dtype=torch.int32, device=device)
+    kernel[(1, )](x, y, z, N=N, CMP=cmp_fn)
+    ref = eval(cmp, {"x": x.float(), "y": y.float()}).to(torch.int32)
+    torch.testing.assert_close(z, ref, atol=0, rtol=0)
+
+
+@pytest.mark.interpreter
 @pytest.mark.parametrize("expr", ["tl.math.fdiv(x, y)", "tl.math.div_rn(x, y)"])
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
 def test_math_divide_op(expr, num_ctas, device):
