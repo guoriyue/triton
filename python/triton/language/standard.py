@@ -347,10 +347,15 @@ def _prod_combine(a, b):
 
 @core._tensor_member_fn
 @jit
-@core._add_scan_docstr("cumprod")
-def cumprod(input, axis=0, reverse=False):
+@core._add_scan_docstr("cumprod", dtype_arg="dtype")
+def cumprod(input, axis=0, reverse=False, dtype: core.constexpr = None):
     # todo rename this to a generic function name
     input = core._promote_bfloat16_to_float32(input)
+    # Pick a default dtype for the scan if one was not specified. Narrow
+    # integers are upcast to int32/uint32 to avoid overflow, matching cumsum:
+    # a running product overflows a small integer width far faster than a sum.
+    out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
+    input = input.to(out_dtype)
     return core.associative_scan(input, axis, _prod_combine, reverse)
 
 

@@ -7316,6 +7316,35 @@ def test_cumsum_dtype(device):
 
 
 @pytest.mark.interpreter
+def test_cumprod_dtype(device):
+
+    # Narrow integer inputs are upcast to int32 (like cumsum/sum) so the running
+    # product does not overflow the input width.
+    @triton.jit
+    def kernel_default(Z):
+        x = tl.full((8, ), 2, dtype=tl.int8)
+        z = tl.cumprod(x, axis=0)
+        tl.store(Z + tl.arange(0, 8), z)
+
+    z = torch.zeros(8, dtype=torch.int32, device=device)
+    kernel_default[(1, )](z)
+    expected = torch.tensor([2, 4, 8, 16, 32, 64, 128, 256], dtype=torch.int32, device=device)
+    assert torch.equal(z, expected)
+
+    # An explicit dtype forces the accumulation type.
+    @triton.jit
+    def kernel_dtype(Z):
+        x = (tl.arange(0, 8) + 1).to(tl.int32)
+        z = tl.cumprod(x, axis=0, dtype=tl.float32)
+        tl.store(Z + tl.arange(0, 8), z)
+
+    z = torch.zeros(8, dtype=torch.float32, device=device)
+    kernel_dtype[(1, )](z)
+    expected = torch.tensor([1, 2, 6, 24, 120, 720, 5040, 40320], dtype=torch.float32, device=device)
+    assert torch.equal(z, expected)
+
+
+@pytest.mark.interpreter
 def test_tensor_member(device):
 
     @triton.jit
