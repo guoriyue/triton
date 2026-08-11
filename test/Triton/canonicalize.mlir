@@ -175,6 +175,28 @@ tt.func @fold_transpose_constant() -> tensor<128x16xf32> {
 }
 // -----
 
+// CHECK-LABEL: @fold_split_of_join
+tt.func @fold_split_of_join(%a: tensor<32xf32>, %b: tensor<32xf32>) -> (tensor<32xf32>, tensor<32xf32>) {
+    // CHECK-NOT: tt.join
+    // CHECK-NOT: tt.split
+    // CHECK: tt.return %arg0, %arg1
+    %j = tt.join %a, %b : tensor<32xf32> -> tensor<32x2xf32>
+    %l, %r = tt.split %j : tensor<32x2xf32> -> tensor<32xf32>
+    tt.return %l, %r : tensor<32xf32>, tensor<32xf32>
+}
+// -----
+
+// CHECK-LABEL: @fold_join_of_split
+tt.func @fold_join_of_split(%x: tensor<32x2xf32>) -> tensor<32x2xf32> {
+    // CHECK-NOT: tt.split
+    // CHECK-NOT: tt.join
+    // CHECK: tt.return %arg0
+    %l, %r = tt.split %x : tensor<32x2xf32> -> tensor<32xf32>
+    %j = tt.join %l, %r : tensor<32xf32> -> tensor<32x2xf32>
+    tt.return %j : tensor<32x2xf32>
+}
+// -----
+
 // CHECK-LABEL: @canonicalize_int_to_ptr_of_ptr_to_int
 // Test: int_to_ptr(ptr_to_int(ptr)) -> ptr (round-trip elimination)
 tt.func @canonicalize_int_to_ptr_of_ptr_to_int(%ptr: tensor<64x!tt.ptr<f32>>) -> tensor<64x!tt.ptr<f32>> {

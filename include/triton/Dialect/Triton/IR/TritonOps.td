@@ -548,6 +548,7 @@ def TT_JoinOp : TT_Op<"join", [
     let arguments = (ins TT_Tensor:$lhs, TT_Tensor:$rhs);
     let results = (outs TT_Tensor:$result);
     let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)";
+    let hasCanonicalizeMethod = 1;
     let hasVerifier = 1;
 }
 
@@ -569,6 +570,7 @@ def TT_SplitOp : TT_Op<"split", [
     let arguments = (ins TT_Tensor:$src);
     let results = (outs TT_Tensor:$outLHS, TT_Tensor:$outRHS);
     let assemblyFormat = "$src attr-dict `:` type($src) `->` type($outLHS)";
+    let hasCanonicalizeMethod = 1;
 }
 
 def TT_TransOp : TT_Op<"trans", [Pure,

@@ -1427,6 +1427,28 @@ LogicalResult JoinOp::verify() {
   return success();
 }
 
+LogicalResult JoinOp::canonicalize(JoinOp op, PatternRewriter &rewriter) {
+  // join(split(x)#0, split(x)#1) -> x
+  //
+  // The reverse of the split(join) fold: if both operands are the two results
+  // of the same split, joining them reconstructs the split's source.  Require
+  // lhs/rhs to be results 0/1 of one split and the source type to match, so the
+  // rewrite is exact for any encoding.
+  auto lhs = dyn_cast<OpResult>(op.getLhs());
+  auto rhs = dyn_cast<OpResult>(op.getRhs());
+  if (!lhs || !rhs || lhs.getOwner() != rhs.getOwner())
+    return failure();
+  auto split = dyn_cast<SplitOp>(lhs.getOwner());
+  if (!split)
+    return failure();
+  if (lhs.getResultNumber() != 0 || rhs.getResultNumber() != 1)
+    return failure();
+  if (split.getSrc().getType() != op.getType())
+    return failure();
+  rewriter.replaceOp(op, split.getSrc());
+  return success();
+}
+
 // -- SplitOp --
 bool SplitOp::isCompatibleReturnTypes(TypeRange lhs, TypeRange rhs) {
   for (auto [lhs, rhs] : llvm::zip_equal(lhs, rhs)) {
@@ -1477,6 +1499,22 @@ LogicalResult SplitOp::inferReturnTypes(
   inferredReturnTypes.push_back(retTy);
   inferredReturnTypes.push_back(retTy);
   return success();
+}
+
+LogicalResult SplitOp::canonicalize(SplitOp op, PatternRewriter &rewriter) {
+  // split(join(a, b)) -> (a, b)
+  //
+  // join stacks its two operands along a new minor dimension of size 2 and
+  // split returns src[..., 0] and src[..., 1], so the two ops are exact
+  // inverses.  Guard on matching types so the replacement is a nop for any
+  // encoding (join's operands share a type, split's results share a type).
+  if (auto join = op.getSrc().getDefiningOp<JoinOp>()) {
+    if (join.getLhs().getType() == op.getOutLHS().getType()) {
+      rewriter.replaceOp(op, {join.getLhs(), join.getRhs()});
+      return success();
+    }
+  }
+  return failure();
 }
 
 // -- ElementwiseInlineAsmOp --
