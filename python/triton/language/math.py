@@ -222,6 +222,15 @@ def erf(x, _semantic=None):
 @core._tensor_member_fn
 @core.builtin
 @_check_dtype(dtypes=["fp32", "fp64"])
+@_add_math_1arg_docstr("hyperbolic tangent")
+def tanh(x, _semantic=None):
+    x = _semantic.to_tensor(x)
+    return core.tensor(_semantic.builder.create_tanh(x.handle), x.type)
+
+
+@core._tensor_member_fn
+@core.builtin
+@_check_dtype(dtypes=["fp32", "fp64"])
 @_add_math_1arg_docstr("floor")
 def floor(x, _semantic=None):
     x = _semantic.to_tensor(x)

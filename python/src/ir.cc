@@ -1770,6 +1770,10 @@ void init_triton_ir(py::module_ &m) {
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::ErfOp>(val);
            })
+      .def("create_tanh",
+           [](TritonOpBuilder &self, Value &val) -> Value {
+             return self.create<math::TanhOp>(val);
+           })
       .def("create_sqrt",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::SqrtOp>(val);

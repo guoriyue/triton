@@ -703,6 +703,8 @@ class InterpreterBuilder:
         ret = np_erf_fp32(arg.data) if arg.data.dtype == np.float32 else np_erf_fp64(arg.data)
         return TensorHandle(ret, arg.dtype.scalar)
 
+    create_tanh = lambda self, arg: self.unary_op(arg, np.tanh)
+
     def create_rsqrt(self, arg):
         return TensorHandle(1 / np.sqrt(arg.data), arg.dtype.scalar)
 

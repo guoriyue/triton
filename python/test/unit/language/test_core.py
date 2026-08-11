@@ -1135,6 +1135,28 @@ def test_math_erf_op(dtype, member_fn, device):
 
 
 @pytest.mark.interpreter
+@pytest.mark.parametrize("member_fn", [False, True])
+@pytest.mark.parametrize("dtype", [dtype for dtype in ["float32", "float64"]])
+def test_math_tanh_op(dtype, member_fn, device):
+    check_type_supported(dtype, device)
+    SIZE = 128
+
+    @triton.jit
+    def kernel(Z, X, SIZE: tl.constexpr, MEMBER_FN: tl.constexpr):
+        off = tl.arange(0, SIZE)
+        x = tl.load(X + off)
+        z = x.tanh() if MEMBER_FN else tl.math.tanh(x)
+        tl.store(Z + off, z)
+
+    torch_dtype = torch.float32 if dtype == "float32" else torch.float64
+    x = torch.randn(SIZE, dtype=torch_dtype, device=device)
+    z_ref = torch.tanh(x)
+    z_tri = torch.zeros_like(x)
+    kernel[(1, )](z_tri, x, SIZE=SIZE, MEMBER_FN=member_fn, num_warps=4)
+    torch.testing.assert_close(z_tri, z_ref)
+
+
+@pytest.mark.interpreter
 @pytest.mark.parametrize("dtype", [dtype for dtype in ["float32", "float64"]])
 def test_math_fma_op(dtype, device):
     check_type_supported(dtype, device)
