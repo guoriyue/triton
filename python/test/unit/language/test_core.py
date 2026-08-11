@@ -2861,6 +2861,34 @@ def test_reduce1d(op, dtype_str, shape, num_ctas, device):
             np.testing.assert_equal(z_ref, z_tri)
 
 
+@pytest.mark.interpreter
+@pytest.mark.parametrize("keep_dims", [False, True])
+def test_prod(keep_dims, device):
+    # prod mirrors sum: float product plus a narrow-int overflow-safe upcast.
+    @triton.jit
+    def kernel(X, Z, BLOCK: tl.constexpr, KEEP: tl.constexpr):
+        x = tl.load(X + tl.arange(0, BLOCK))
+        z = tl.prod(x, axis=0, keep_dims=KEEP)
+        tl.store(Z + tl.arange(0, 1), z.reshape(1) if KEEP else z[None])
+
+    BLOCK = 8
+    x = torch.arange(1, BLOCK + 1, dtype=torch.float32, device=device)
+    z = torch.zeros(1, dtype=torch.float32, device=device)
+    kernel[(1, )](x, z, BLOCK=BLOCK, KEEP=keep_dims)
+    torch.testing.assert_close(z, torch.prod(x).reshape(1))
+
+    # int8 input: the running product is upcast to int32 to avoid overflow.
+    @triton.jit
+    def kernel_int(X, Z, BLOCK: tl.constexpr):
+        z = tl.prod(tl.load(X + tl.arange(0, BLOCK)), axis=0)
+        tl.store(Z, z)
+
+    xi = torch.full((BLOCK, ), 2, dtype=torch.int8, device=device)
+    zi = torch.zeros(1, dtype=torch.int32, device=device)
+    kernel_int[(1, )](xi, zi, BLOCK=BLOCK)
+    assert zi.item() == 2**BLOCK
+
+
 # TODO: [Qingyi] Fix argmin / argmax
 reduce_configs1 = [(op, dtype, (1, 1024), axis, False)
                    for dtype in dtypes_with_bfloat16

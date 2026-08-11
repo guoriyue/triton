@@ -354,6 +354,20 @@ def cumprod(input, axis=0, reverse=False):
     return core.associative_scan(input, axis, _prod_combine, reverse)
 
 
+# prod
+
+
+@core._tensor_member_fn
+@jit
+@core._add_reduction_docstr("prod", dtype_arg="dtype")
+def prod(input, axis=None, keep_dims=False, dtype: core.constexpr = None):
+    # Pick a default dtype for the reduction if one was not specified. This
+    # mirrors sum: narrow integers are upcast to int32/uint32 to avoid overflow.
+    out_dtype: core.constexpr = _pick_sum_dtype(input.dtype, dtype)
+    input = input.to(out_dtype)
+    return core.reduce(input, axis, _prod_combine, keep_dims=keep_dims)
+
+
 # sort
 
 
