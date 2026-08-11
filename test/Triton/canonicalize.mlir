@@ -175,6 +175,27 @@ tt.func @fold_transpose_constant() -> tensor<128x16xf32> {
 }
 // -----
 
+// CHECK-LABEL: @fold_bitcast_chain
+tt.func @fold_bitcast_chain(%arg0: tensor<64xi32>) -> tensor<64xf32> {
+    // CHECK-COUNT-1: tt.bitcast
+    // CHECK-NOT: tt.bitcast
+    %a = tt.bitcast %arg0 : tensor<64xi32> -> tensor<64xf32>
+    %b = tt.bitcast %a : tensor<64xf32> -> tensor<64xi32>
+    %c = tt.bitcast %b : tensor<64xi32> -> tensor<64xf32>
+    tt.return %c : tensor<64xf32>
+}
+// -----
+
+// CHECK-LABEL: @fold_bitcast_chain_to_identity
+tt.func @fold_bitcast_chain_to_identity(%arg0: tensor<64xi32>) -> tensor<64xi32> {
+    // CHECK-NOT: tt.bitcast
+    // CHECK: tt.return %arg0
+    %a = tt.bitcast %arg0 : tensor<64xi32> -> tensor<64xf32>
+    %b = tt.bitcast %a : tensor<64xf32> -> tensor<64xi32>
+    tt.return %b : tensor<64xi32>
+}
+// -----
+
 // CHECK-LABEL: @canonicalize_int_to_ptr_of_ptr_to_int
 // Test: int_to_ptr(ptr_to_int(ptr)) -> ptr (round-trip elimination)
 tt.func @canonicalize_int_to_ptr_of_ptr_to_int(%ptr: tensor<64x!tt.ptr<f32>>) -> tensor<64x!tt.ptr<f32>> {

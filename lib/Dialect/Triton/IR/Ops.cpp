@@ -1059,6 +1059,16 @@ LogicalResult FpToFpOp::verify() {
 OpFoldResult BitcastOp::fold(FoldAdaptor adaptor) {
   if (getSrc().getType() == getType())
     return getSrc();
+  // bitcast(bitcast(x)) -> bitcast(x)
+  //
+  // The verifier requires every bitcast to preserve the bit width (and pointer
+  // address space), so reinterpreting straight from the original source to this
+  // op's result type is identical to going through the intermediate type.  The
+  // identity check above then collapses the degenerate x -> A -> x case to x.
+  if (auto innerBitcast = getSrc().getDefiningOp<BitcastOp>()) {
+    setOperand(innerBitcast.getSrc());
+    return getResult();
+  }
   return {};
 }
 
