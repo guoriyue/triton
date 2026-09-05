@@ -596,3 +596,169 @@ tt.func @prologue_output(%ub: i32) {
 
   tt.return
 }
+
+// -----
+
+// The loaded divisor and the division must both stay under the outer trip
+// condition. Preserve the original load mask and the zero-trip result.
+// CHECK-LABEL: @speculate_loaded_bound
+// CHECK-SAME: [[PTR:%.*]]: !tt.ptr<i32>, [[MASK:%.*]]: i1, [[LB:%.*]]: i32, [[UB:%.*]]: i32, [[INIT:%.*]]: i32
+// CHECK-NOT: tt.load
+// CHECK: [[NONEMPTY:%.*]] = arith.cmpi slt, [[LB]], [[UB]]
+// CHECK-NEXT: [[RESULT:%.*]] = scf.if [[NONEMPTY]] -> (i32) {
+// CHECK-NEXT: [[DIVISOR:%.*]] = tt.load [[PTR]], [[MASK]], %c1_i32
+// CHECK-NEXT: arith.divsi %c6_i32, [[DIVISOR]]
+// CHECK: scf.for
+// CHECK: scf.yield [[INIT]] : i32
+// CHECK-NEXT: }
+// CHECK-NEXT: tt.return [[RESULT]] : i32
+tt.func @speculate_loaded_bound(%ptr: !tt.ptr<i32>, %mask: i1, %lb: i32, %ub: i32, %init: i32) -> i32 {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c6 = arith.constant 6 : i32
+  %result = scf.for %i = %lb to %ub step %c1 iter_args(%acc = %init) -> i32 : i32 {
+    %divisor = tt.load %ptr, %mask, %c1 : !tt.ptr<i32>
+    %bound = arith.divsi %c6, %divisor : i32
+    %sum = scf.for %j = %c0 to %bound step %c1 iter_args(%value = %acc) -> i32 : i32 {
+      %next = arith.addi %value, %j : i32
+      scf.yield %next : i32
+    }
+    scf.yield %sum : i32
+  } {tt.flatten}
+  tt.return %result : i32
+}
+
+// -----
+
+// Exercise the direct fusion path, which does not speculate the inner length.
+// CHECK-LABEL: @fuse_loaded_bound_unsigned
+// CHECK-SAME: [[PTR:%.*]]: !tt.ptr<i32>, [[LB:%.*]]: i32, [[UB:%.*]]: i32, [[INIT:%.*]]: i32
+// CHECK-NOT: tt.load
+// CHECK: [[NONEMPTY:%.*]] = arith.cmpi ult, [[LB]], [[UB]]
+// CHECK-NEXT: [[RESULT:%.*]] = scf.if [[NONEMPTY]] -> (i32) {
+// CHECK-NEXT: tt.load [[PTR]]
+// CHECK: scf.for
+// CHECK-NOT: scf.for
+// CHECK: scf.yield [[INIT]] : i32
+// CHECK-NEXT: }
+// CHECK-NEXT: tt.return [[RESULT]] : i32
+tt.func @fuse_loaded_bound_unsigned(%ptr: !tt.ptr<i32>, %lb: i32, %ub: i32, %init: i32) -> i32 {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %result = scf.for unsigned %i = %lb to %ub step %c1 iter_args(%acc = %init) -> i32 : i32 {
+    %bound = tt.load %ptr : !tt.ptr<i32>
+    %sum = scf.for %j = %c0 to %bound step %c1 iter_args(%value = %acc) -> i32 : i32 {
+      %next = arith.addi %value, %j : i32
+      scf.yield %next : i32
+    }
+    scf.yield %sum : i32
+  } {"ttg.always-fuse"}
+  tt.return %result : i32
+}
+
+// -----
+
+// A statically nonempty outer loop does not need a runtime guard.
+// CHECK-LABEL: @fuse_nonempty_loaded_bound
+// CHECK-SAME: [[PTR:%.*]]: !tt.ptr<i32>
+// CHECK-NOT: scf.if
+// CHECK: tt.load [[PTR]]
+// CHECK-NOT: scf.if
+// CHECK: scf.for
+// CHECK-NOT: scf.for
+// CHECK: tt.return
+tt.func @fuse_nonempty_loaded_bound(%ptr: !tt.ptr<i32>, %init: i32) -> i32 {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %c2 = arith.constant 2 : i32
+  %result = scf.for %i = %c0 to %c2 step %c1 iter_args(%acc = %init) -> i32 : i32 {
+    %bound = tt.load %ptr : !tt.ptr<i32>
+    %sum = scf.for %j = %c0 to %bound step %c1 iter_args(%value = %acc) -> i32 : i32 {
+      %next = arith.addi %value, %j : i32
+      scf.yield %next : i32
+    }
+    scf.yield %sum : i32
+  } {"ttg.always-fuse"}
+  tt.return %result : i32
+}
+
+// -----
+
+// After fusing the inner pair, keep its execution guard inside the outer loop.
+// CHECK-LABEL: @fuse_guarded_child
+// CHECK-SAME: [[PTR:%.*]]: !tt.ptr<i32>, [[UB:%.*]]: i32, [[INIT:%.*]]: i32
+// CHECK-NOT: tt.load
+// CHECK: scf.for [[I:%.*]] = %c0_i32 to [[UB]]
+// CHECK: [[NONEMPTY:%.*]] = arith.cmpi sgt, [[I]], %c0_i32
+// CHECK-NEXT: {{.*}}scf.if [[NONEMPTY]]
+// CHECK-NEXT: tt.load [[PTR]]
+// CHECK: scf.for
+// CHECK-NOT: scf.for
+// CHECK: tt.return
+tt.func @fuse_guarded_child(%ptr: !tt.ptr<i32>, %ub: i32, %init: i32) -> i32 {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %result = scf.for %i = %c0 to %ub step %c1 iter_args(%a = %init) -> i32 : i32 {
+    %middle = scf.for %j = %c0 to %i step %c1 iter_args(%b = %a) -> i32 : i32 {
+      %bound = tt.load %ptr : !tt.ptr<i32>
+      %inner = scf.for %k = %c0 to %bound step %c1 iter_args(%c = %b) -> i32 : i32 {
+        %next = arith.addi %c, %k : i32
+        scf.yield %next : i32
+      }
+      scf.yield %inner : i32
+    }
+    scf.yield %middle : i32
+  } {"ttg.always-fuse"}
+  tt.return %result : i32
+}
+
+// -----
+
+// CHECK-LABEL: @fuse_loaded_bound_no_results
+// CHECK-SAME: [[PTR:%.*]]: !tt.ptr<i32>, [[OUT:%.*]]: !tt.ptr<i32>, [[UB:%.*]]: i32
+// CHECK-NOT: tt.load
+// CHECK: [[NONEMPTY:%.*]] = arith.cmpi sgt, [[UB]], %c0_i32
+// CHECK-NEXT: scf.if [[NONEMPTY]] {
+// CHECK-NEXT: tt.load [[PTR]]
+// CHECK: scf.for
+// CHECK-NOT: scf.for
+// CHECK: tt.store [[OUT]]
+// CHECK: tt.return
+tt.func @fuse_loaded_bound_no_results(%ptr: !tt.ptr<i32>, %out: !tt.ptr<i32>, %ub: i32) {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  scf.for %i = %c0 to %ub step %c1 : i32 {
+    %bound = tt.load %ptr : !tt.ptr<i32>
+    scf.for %j = %c0 to %bound step %c1 : i32 {
+      tt.store %out, %j : !tt.ptr<i32>
+    }
+  } {"ttg.always-fuse"}
+  tt.return
+}
+
+// -----
+
+// Dependent loads cloned into the bound-counting loop retain its trip guard.
+// CHECK-LABEL: @slice_loaded_bound
+// CHECK-SAME: [[PTR:%.*]]: !tt.ptr<i32>, [[UB:%.*]]: i32, [[INIT:%.*]]: i32
+// CHECK-NOT: tt.load
+// CHECK: scf.for [[I:%.*]] = %c0_i32 to [[UB]]
+// CHECK-NEXT: [[P:%.*]] = tt.addptr [[PTR]], [[I]]
+// CHECK-NEXT: tt.load [[P]]
+// CHECK: scf.for
+// CHECK: tt.load
+// CHECK: tt.return
+tt.func @slice_loaded_bound(%ptr: !tt.ptr<i32>, %ub: i32, %init: i32) -> i32 {
+  %c0 = arith.constant 0 : i32
+  %c1 = arith.constant 1 : i32
+  %result = scf.for %i = %c0 to %ub step %c1 iter_args(%acc = %init) -> i32 : i32 {
+    %p = tt.addptr %ptr, %i : !tt.ptr<i32>, i32
+    %bound = tt.load %p : !tt.ptr<i32>
+    %sum = scf.for %j = %c0 to %bound step %c1 iter_args(%value = %acc) -> i32 : i32 {
+      %next = arith.addi %value, %j : i32
+      scf.yield %next : i32
+    }
+    scf.yield %sum : i32
+  } {"ttg.always-fuse"}
+  tt.return %result : i32
+}
