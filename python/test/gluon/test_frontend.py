@@ -3029,6 +3029,54 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 """)
 
 
+@gluon.jit
+def _async_copy_element_types_kernel(P, SMEM_DTYPE: ttgl.constexpr, API: ttgl.constexpr, MASKED: ttgl.constexpr,
+                                     WARP_SIZE: ttgl.constexpr):
+    layout: ttgl.constexpr = ttgl.BlockedLayout([2], [WARP_SIZE], [4], [0])
+    offsets = ttgl.arange(0, 128, layout)
+    mem = ttgl.allocate_shared_memory(SMEM_DTYPE, [128], ttgl.SwizzledSharedLayout(1, 1, 1, [0]))
+    if MASKED:
+        mask = offsets < 96
+    else:
+        mask = None
+    if API == "ampere":
+        async_copy.async_load(mem, P + offsets, mask=mask)
+        async_copy.commit_group()
+        async_copy.wait_group(0)
+    elif API == "cdna4_global":
+        cdna4_async_copy.global_load_to_shared(mem, P + offsets, mask=mask)
+        cdna4_async_copy.commit_group()
+        cdna4_async_copy.wait_group(0)
+    elif API == "cdna4_buffer":
+        cdna4_async_copy.buffer_load_to_shared(mem, P, offsets, mask=mask)
+        cdna4_async_copy.commit_group()
+        cdna4_async_copy.wait_group(0)
+    elif API == "cdna5_global":
+        cdna5_async_copy.global_to_shared(mem, P + offsets, mask=mask)
+        cdna5_async_copy.commit_group()
+        cdna5_async_copy.wait_group(0)
+    else:
+        mem.store(ttgl.full([128], 1, SMEM_DTYPE, layout))
+        cdna5_async_copy.shared_to_global(P + offsets, mem, mask=mask)
+        cdna5_async_copy.commit_group()
+        cdna5_async_copy.wait_group(0)
+
+
+@pytest.mark.parametrize("api, target", [("ampere", AMPERE_TARGET), ("cdna4_global", HIP_TARGET_CDNA4),
+                                         ("cdna4_buffer", HIP_TARGET_CDNA4), ("cdna5_global", HIP_TARGET_CDNA5),
+                                         ("cdna5_store", HIP_TARGET_CDNA5)])
+@pytest.mark.parametrize("pointer_dtype, memory_dtype", [(ttgl.float32, ttgl.float16), (ttgl.float16, ttgl.float32),
+                                                         (ttgl.int32, ttgl.float32), (ttgl.float32, ttgl.float32)])
+@pytest.mark.parametrize("masked", [False, True])
+def test_async_copy_element_types(api, target, pointer_dtype, memory_dtype, masked):
+    args = make_args(MockTensor(pointer_dtype), memory_dtype, api, masked, target.warp_size)
+    if pointer_dtype == memory_dtype:
+        run_parser(_async_copy_element_types_kernel, *args, target=target)
+    else:
+        with pytest.raises(CompilationError, match="shared memory element type must match pointer element type"):
+            run_parser(_async_copy_element_types_kernel, *args, target=target)
+
+
 @pytest.mark.parametrize("target", ALL_TARGETS)
 def test_split_join_subtile(target):
 

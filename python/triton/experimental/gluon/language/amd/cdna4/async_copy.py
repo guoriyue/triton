@@ -60,6 +60,7 @@ def global_load_to_shared(dest, ptr, mask=None, other=None, cache_modifier="", _
         dest.shape == ptr.shape, lambda:
         f"expected dest shape to match pointer shape but got dest.shape = {dest.shape}, pointer.shape = {ptr.shape}")
 
+    _check(dest.dtype == ptr.dtype.element_ty, lambda: "shared memory element type must match pointer element type")
     mask = _unwrap_if_constexpr(mask)
     if mask is not None:
         ptr, mask = _semantic.broadcast_impl_value(ptr, mask)
@@ -124,6 +125,7 @@ def buffer_load_to_shared(dest, ptr, offsets, mask=None, other=None, cache_modif
     _check(isinstance(offsets.type.layout, DistributedLayout),
            lambda: "expected offsets type layout to be a DistributedLayout")
     _verify_buffer_ops(ptr, offsets, mask, other)
+    _check(dest.dtype == ptr.dtype.element_ty, lambda: "shared memory element type must match pointer element type")
 
     mask = _unwrap_if_constexpr(mask)
     if mask is not None:

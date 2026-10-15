@@ -1,5 +1,48 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @async_copy_load_mismatched_elements_0(%ptr: tensor<128x!tt.ptr<f32>, #blocked>,
+      %mem: !ttg.memdesc<128xf16, #shared, #smem, mutable>) {
+    // expected-error @+1 {{source pointee type 'f32' must match shared memory element type 'f16'}}
+    %token = ttg.async_copy_global_to_local %ptr, %mem : tensor<128x!tt.ptr<f32>, #blocked> -> <128xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @async_copy_load_mismatched_elements_1(%ptr: tensor<128x!tt.ptr<f16>, #blocked>,
+      %mem: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
+    // expected-error @+1 {{source pointee type 'f16' must match shared memory element type 'f32'}}
+    %token = ttg.async_copy_global_to_local %ptr, %mem : tensor<128x!tt.ptr<f16>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @async_copy_load_mismatched_elements_2(%ptr: tensor<128x!tt.ptr<i32>, #blocked>,
+      %mem: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
+    // expected-error @+1 {{source pointee type 'i32' must match shared memory element type 'f32'}}
+    %token = ttg.async_copy_global_to_local %ptr, %mem : tensor<128x!tt.ptr<i32>, #blocked> -> <128xf32, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+
 #blocked0 = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [2, 2], order = [1, 0]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [4, 1], threadsPerWarp = [4, 8], warpsPerCTA = [2, 2], order = [0, 1]}>
 

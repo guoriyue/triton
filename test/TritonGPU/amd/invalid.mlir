@@ -1,5 +1,48 @@
 // RUN: triton-opt --split-input-file %s --verify-diagnostics
 
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @async_copy_store_mismatched_elements_0(%ptr: tensor<128x!tt.ptr<f32>, #blocked>,
+      %mem: !ttg.memdesc<128xf16, #shared, #smem, mutable>) {
+    // expected-error @+1 {{destination pointee type 'f32' must match shared memory element type 'f16'}}
+    %token = amdg.async_copy_local_to_global %mem, %ptr : !ttg.memdesc<128xf16, #shared, #smem, mutable> -> tensor<128x!tt.ptr<f32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @async_copy_store_mismatched_elements_1(%ptr: tensor<128x!tt.ptr<f16>, #blocked>,
+      %mem: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
+    // expected-error @+1 {{destination pointee type 'f16' must match shared memory element type 'f32'}}
+    %token = amdg.async_copy_local_to_global %mem, %ptr : !ttg.memdesc<128xf32, #shared, #smem, mutable> -> tensor<128x!tt.ptr<f16>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+#blocked = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @async_copy_store_mismatched_elements_2(%ptr: tensor<128x!tt.ptr<i32>, #blocked>,
+      %mem: !ttg.memdesc<128xf32, #shared, #smem, mutable>) {
+    // expected-error @+1 {{destination pointee type 'i32' must match shared memory element type 'f32'}}
+    %token = amdg.async_copy_local_to_global %mem, %ptr : !ttg.memdesc<128xf32, #shared, #smem, mutable> -> tensor<128x!tt.ptr<i32>, #blocked>
+    tt.return
+  }
+}
+
+// -----
+
+
 // expected-error @+1 {{WMMA version must be in the [1, 3] range}}
 #wmma = #ttg.amd_wmma<{version = 0, isTranspose = false, ctaLayout = {warp = [[0, 1], [1, 0]]}}>
 module attributes {"ttg.num-warps" = 4 : i32, "ttg.num-ctas" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {

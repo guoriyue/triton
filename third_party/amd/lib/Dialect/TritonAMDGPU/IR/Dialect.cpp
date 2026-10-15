@@ -1383,6 +1383,13 @@ LogicalResult AsyncCopyLocalToGlobalOp::verify() {
   auto srcTy = getSrc().getType();
   if (!isa<gpu::SharedMemorySpaceAttr>(srcTy.getMemorySpace()))
     return emitOpError("source must be in shared memory");
+  auto pointeeType =
+      cast<triton::PointerType>(getDst().getType().getElementType())
+          .getPointeeType();
+  if (pointeeType != srcTy.getElementType())
+    return emitOpError("destination pointee type ")
+           << pointeeType << " must match shared memory element type "
+           << srcTy.getElementType();
 
   return triton::verifyCachePolicy(getOperation(), getCachePolicyAttr(),
                                    triton::CachePolicyOperation::Store);
