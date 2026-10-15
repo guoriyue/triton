@@ -9,6 +9,7 @@ import shutil
 import pathlib
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from contextlib import ExitStack
+from collections import namedtuple
 
 import pytest
 import torch
@@ -17,6 +18,63 @@ import triton
 import triton.language as tl
 from triton._internal_testing import is_hip
 from triton.runtime.cache import FileCacheManager, RemoteCacheManager
+from triton.runtime.jit import compute_cache_key
+
+
+@pytest.mark.parametrize("first, second", [(1, 1.0), (1, True), (0.0, -0.0), ((1, (0.0, )), (1.0, (-0.0, ))),
+                                           (tl.constexpr(1), tl.constexpr(1.0))])
+def test_kernel_key_cache_constexpr_identity(first, second):
+    for a, b in [(first, second), (second, first)]:
+        cache = {}
+        a_spec = [("constexpr", a)]
+        b_spec = [("constexpr", b)]
+        a_key = compute_cache_key(cache, a_spec, {})
+        b_key = compute_cache_key(cache, b_spec, {})
+        assert a_key != b_key
+        assert a_key == compute_cache_key({}, a_spec, {})
+        assert b_key == compute_cache_key({}, b_spec, {})
+        assert len(cache) == 2
+        assert compute_cache_key(cache, a_spec, {}) == a_key
+        assert len(cache) == 2
+
+
+def test_kernel_key_cache_namedtuple_fields():
+    first = namedtuple("Parameters", ["value"])(1)
+    second = namedtuple("Parameters", ["other"])(1)
+    cache = {}
+    first_key = compute_cache_key(cache, [("constexpr", first)], {})
+    second_key = compute_cache_key(cache, [("constexpr", second)], {})
+    assert first_key != second_key
+    assert "value" in first_key
+    assert "other" in second_key
+
+
+@pytest.mark.parametrize("first, second", [(1, 1.0), (1, True), (0.0, -0.0), ((1, ), (1.0, ))])
+def test_constexpr_launch_order_identity(first, second, device):
+
+    @triton.jit
+    def identity_kernel(X, Y, C: tl.constexpr, TUPLE: tl.constexpr):
+        if TUPLE:
+            c = C[0]
+        else:
+            c = C
+        tl.store(Y, tl.load(X) * c)
+
+    dtype = torch.float32 if first == 0.0 else torch.int32
+    x = torch.tensor([1 if dtype == torch.float32 else 2**30 + 1], dtype=dtype, device=device)
+
+    def launch(c):
+        y = torch.empty_like(x)
+        identity_kernel[(1, )](x, y, c, isinstance(c, tuple))
+        return y.view(torch.int32).item()
+
+    for a, b in [(first, second), (second, first)]:
+        identity_kernel.device_caches.clear()
+        expected = launch(b)
+        identity_kernel.device_caches.clear()
+        launch(a)
+        assert launch(b) == expected
+        assert sum(len(entry[0]) for entry in identity_kernel.device_caches.values()) == 2
 
 
 @pytest.mark.parametrize("backend, options_type, arch", [

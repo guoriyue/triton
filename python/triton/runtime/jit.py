@@ -601,7 +601,7 @@ class JitFunctionInfo:
 def _replace_jit_callables(obj):
     if isinstance(obj, list):
         return [_replace_jit_callables(arg) for arg in obj]
-    elif is_namedtuple(obj):
+    elif is_namedtuple(type(obj)):
         results = [_replace_jit_callables(arg) for arg in obj]
         return obj.__class__(*results)
     elif isinstance(obj, tuple):
@@ -611,8 +611,30 @@ def _replace_jit_callables(obj):
     return obj
 
 
-def compute_cache_key(kernel_key_cache, specialization, options):
-    key = (tuple(specialization), str(options))
+def _constexpr_cache_identity(value):
+    value_type = type(value)
+    if value_type is int or value_type is bool or value_type is str or value is None:
+        return value_type
+    if isinstance(value, float):
+        return type(value), value.hex()
+    if isinstance(value, tuple):
+        return type(value), tuple(_constexpr_cache_identity(element) for element in value)
+    from ..language.core import constexpr
+    if isinstance(value, constexpr):
+        return type(value), _constexpr_cache_identity(value.value)
+    return value_type
+
+
+def compute_cache_key(kernel_key_cache, specialization, options, constexpr_indices=None):
+    # Python equality merges constants with different compilation semantics,
+    # such as 1 and 1.0 or the two signs of zero.
+    if constexpr_indices is None:
+        constexpr_indices = [i for i, arg in enumerate(specialization) if arg[0] == "constexpr"]
+    if constexpr_indices:
+        tags = tuple([_constexpr_cache_identity(specialization[i][1]) for i in constexpr_indices])
+        key = (tuple(specialization), str(options), tags)
+    else:
+        key = (tuple(specialization), str(options))
     cache_key = kernel_key_cache.get(key, None)
     if cache_key is not None:
         return cache_key
@@ -757,7 +779,7 @@ class JITFunction(JITCallable, KernelInterface[T]):
             inspect_stages_key, inspect_stages_hash = knobs.runtime.add_stages_inspection_hook()
             specialization.append(f'("custom_pipeline", {inspect_stages_hash})')
 
-        key = compute_cache_key(kernel_key_cache, specialization, options)
+        key = compute_cache_key(kernel_key_cache, specialization, options, self.constexprs)
         kernel = kernel_cache.get(key, None)
 
         # Kernel is not cached; we have to compile.
