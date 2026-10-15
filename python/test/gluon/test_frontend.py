@@ -1958,6 +1958,35 @@ def test_tensor_layout_type_changed():
 
 
 @gluon.jit
+def _memdesc_index_bounds_kernel(INDEX: ttgl.constexpr, TMEM: ttgl.constexpr, DYNAMIC: ttgl.constexpr):
+    if TMEM:
+        layout: ttgl.constexpr = TensorMemoryLayout(block=[128, 128], col_stride=1)
+        mem = blackwell.allocate_tensor_memory(ttgl.float32, [2, 128, 128], layout)
+    else:
+        mem = ttgl.allocate_shared_memory(ttgl.float32, [2, 128], ttgl.SwizzledSharedLayout(1, 1, 1, [0]))
+    if DYNAMIC:
+        mem.index(ttgl.program_id(0))
+    else:
+        mem.index(INDEX)
+
+
+@pytest.mark.parametrize("tmem", [False, True])
+@pytest.mark.parametrize("index", [-1, 0, 1, 2, 2**31])
+def test_memdesc_index_constant_bounds(index, tmem):
+    args = make_args(index, tmem, False)
+    if 0 <= index < 2:
+        run_parser(_memdesc_index_bounds_kernel, *args, target=BLACKWELL_TARGET)
+    else:
+        with pytest.raises(CompilationError, match=f"index {index} is out of bounds for dimension of size 2"):
+            run_parser(_memdesc_index_bounds_kernel, *args, target=BLACKWELL_TARGET)
+
+
+@pytest.mark.parametrize("tmem", [False, True])
+def test_memdesc_index_dynamic_uniform(tmem):
+    run_parser(_memdesc_index_bounds_kernel, *make_args(0, tmem, True), target=BLACKWELL_TARGET)
+
+
+@gluon.jit
 def tmem_index_kernel():
     layout: ttgl.constexpr = TensorMemoryLayout(block=[128, 128], col_stride=1)
     tmem = ttgl.nvidia.blackwell.allocate_tensor_memory(ttgl.int32, [2, 256, 256], layout)
