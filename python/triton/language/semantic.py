@@ -1778,7 +1778,9 @@ class TritonSemantic(Generic[TensorTy]):
 
     def reduction(self, inputs: Sequence[TensorTy], axis: int, region_builder_fn) -> Tuple[TensorTy, ...]:
         if axis is None:
-            inputs = tuple(self.reshape(t, [t.numel.value], can_reorder=True) for t in inputs)
+            # Independently reordering tuple operands would lose their
+            # elementwise pairing. Single-input reductions can still reorder.
+            inputs = tuple(self.reshape(t, [t.numel.value], can_reorder=len(inputs) == 1) for t in inputs)
             axis = 0
         # get result shape
         shape = inputs[0].type.shape

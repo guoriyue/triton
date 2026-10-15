@@ -3740,6 +3740,54 @@ def test_sum_dtype(device):
     torch.testing.assert_close(out[0], torch.tensor(32 * 32, dtype=torch.bfloat16, device=device))
 
 
+@triton.jit
+def _reduce_all_axes_argmax_combine(v1, i1, v2, i2):
+    take_left = (v1 > v2) | ((v1 == v2) & (i1 < i2))
+    return tl.where(take_left, v1, v2), tl.where(take_left, i1, i2)
+
+
+@pytest.mark.interpreter
+@pytest.mark.parametrize("shape", [(1024, ), (16, 64)])
+@pytest.mark.parametrize("keep_dims", [False, True])
+@pytest.mark.parametrize("tie", [False, True])
+@pytest.mark.parametrize("num_warps", [4, 8])
+def test_tuple_reduce_all_axes_preserves_pairing(shape, keep_dims, tie, num_warps, device):
+
+    @triton.jit
+    def kernel(X, V, I, SHAPE: tl.constexpr, KEEP_DIMS: tl.constexpr, ALL_AXES: tl.constexpr):
+        if len(SHAPE) == 1:
+            offsets = tl.arange(0, SHAPE[0])
+        else:
+            offsets = tl.arange(0, SHAPE[0])[:, None] * SHAPE[1] + tl.arange(0, SHAPE[1])[None, :]
+        x = tl.load(X + offsets)
+        indices = offsets.to(tl.int64)
+        if ALL_AXES:
+            value, index = tl.reduce((x, indices), None, _reduce_all_axes_argmax_combine, keep_dims=KEEP_DIMS)
+            tl.static_assert(len(value.shape) == (len(SHAPE) if KEEP_DIMS else 0))
+        else:
+            value, index = tl.reduce((tl.reshape(x, [x.numel]), tl.reshape(indices, [indices.numel])), 0,
+                                     _reduce_all_axes_argmax_combine)
+        if ALL_AXES and KEEP_DIMS:
+            value = tl.sum(value)
+            index = tl.sum(index)
+        tl.store(V, value)
+        tl.store(I, index)
+
+    size = math.prod(shape)
+    x = ((torch.arange(size, device=device, dtype=torch.int32) * 17 + 13) % size).reshape(shape)
+    if tie:
+        x.flatten()[31] = size
+        x.flatten()[513] = size
+    expected_value = x.max().item()
+    expected_index = x.flatten().argmax().item()
+    value = torch.empty((), dtype=torch.int32, device=device)
+    index = torch.empty((), dtype=torch.int64, device=device)
+    for all_axes in (False, True):
+        kernel[(1, )](x, value, index, shape, keep_dims, all_axes, num_warps=num_warps)
+        assert value.item() == expected_value
+        assert index.item() == expected_index
+
+
 # trivial associative but not commutative function
 @triton.jit
 def get_first_element(a, b):
