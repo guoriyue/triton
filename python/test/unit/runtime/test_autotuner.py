@@ -5,6 +5,9 @@ import triton.language as tl
 import pytest
 
 import pathlib
+import json
+from types import SimpleNamespace
+from triton.backends.compiler import GPUTarget
 from triton._internal_testing import is_cuda, is_hip_cdna2, is_rubin
 
 
@@ -12,6 +15,75 @@ def do_bench(kernel_call, quantiles, use_cuda_graph=False):
     if use_cuda_graph:
         return triton.testing.do_bench_cudagraph(kernel_call, quantiles=quantiles)
     return triton.testing.do_bench(kernel_call, quantiles=quantiles, warmup=1, rep=1)
+
+
+@pytest.mark.parametrize(
+    "second_target",
+    [GPUTarget("cuda", 75, 32), GPUTarget("hip", "gfx942", 64),
+     GPUTarget("cuda", 86, 64)])
+@pytest.mark.parametrize("prune", [False, True])
+def test_autotune_cache_target_switch(second_target, prune, monkeypatch, fresh_knobs):
+    fresh_knobs.runtime.interpret = False
+    target = GPUTarget("cuda", 86, 32)
+    original_target = target
+    launches = []
+    benchmarks = []
+    monkeypatch.setattr("triton.runtime.autotuner.driver",
+                        SimpleNamespace(active=SimpleNamespace(get_current_target=lambda: target)))
+
+    class Kernel:
+        fn = staticmethod(lambda: None)
+
+        def run(self, **kwargs):
+            launches.append((target, kwargs["BLOCK_SIZE"]))
+
+    def benchmark(kernel_call, quantiles):
+        kernel_call()
+        benchmarks.append(launches[-1])
+        preferred = 64 if target == original_target else 32
+        return [float(launches[-1][1] != preferred)] * 3
+
+    def early_prune(configs, named_args, **kwargs):
+        preferred = 64 if target == original_target else 32
+        return [config for config in configs if config.kwargs["BLOCK_SIZE"] == preferred]
+
+    tuner = triton.runtime.Autotuner(Kernel(), arg_names=["N"],
+                                     configs=[triton.Config({"BLOCK_SIZE": 32}),
+                                              triton.Config({"BLOCK_SIZE": 64})], key=["N"], reset_to_zero=None,
+                                     restore_value=None, do_bench=benchmark,
+                                     prune_configs_by={"early_config_prune": early_prune} if prune else None)
+    for current, expected in [(original_target, 64), (second_target, 32), (GPUTarget("cuda", 86, 32), 64)]:
+        target = current
+        tuner.run(N=1024)
+        assert launches[-1] == (current, expected)
+    assert len(tuner.cache) == 2
+    # Disk cache metadata stores the tuning key as JSON.
+    json.dumps(list(tuner.cache))
+    assert len(benchmarks) == (0 if prune else 4)
+
+
+def test_autotune_interpreter_no_target_lookup(monkeypatch, fresh_knobs):
+    fresh_knobs.runtime.interpret = True
+    monkeypatch.setattr("triton.runtime.autotuner.driver", None)
+    launches = []
+
+    class Kernel:
+        fn = staticmethod(lambda: None)
+
+        def run(self, **kwargs):
+            launches.append(kwargs["BLOCK_SIZE"])
+
+    def benchmark(kernel_call, quantiles):
+        kernel_call()
+        return [1.0] * 3
+
+    tuner = triton.runtime.Autotuner(Kernel(), arg_names=[],
+                                     configs=[triton.Config({"BLOCK_SIZE": 32}),
+                                              triton.Config({"BLOCK_SIZE": 64})], key=[], reset_to_zero=None,
+                                     restore_value=None, do_bench=benchmark)
+    tuner.run()
+    tuner.run()
+    assert launches == [32, 64, 32, 32]
 
 
 @pytest.mark.parametrize('use_cuda_graph', [False, True])

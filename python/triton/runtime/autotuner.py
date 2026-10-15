@@ -239,6 +239,9 @@ class Autotuner(KernelInterface):
             for _, arg in _args.items():
                 if hasattr(arg, "dtype"):
                     key.append(str(arg.dtype))
+            if not knobs.runtime.interpret:
+                target = driver.active.get_current_target()
+                key.append((target.backend, target.arch, target.warp_size))
             key = tuple(key)
             if key not in self.cache:
                 used_cached_result = False
